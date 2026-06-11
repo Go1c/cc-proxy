@@ -7,6 +7,7 @@ import http from "http";
 import { spawn, ChildProcess } from "child_process";
 import path from "path";
 import { execSync } from "child_process";
+import fs from "fs";
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const SERVER_SCRIPT = path.join(PROJECT_ROOT, "dist", "server.js");
@@ -20,7 +21,8 @@ function sleep(ms: number) {
 function req(
   method: string,
   pathname: string,
-  body?: unknown
+  body?: unknown,
+  headers: Record<string, string> = {}
 ): Promise<{ status: number; json: any }> {
   return new Promise((resolve) => {
     const data = body !== undefined ? JSON.stringify(body) : undefined;
@@ -32,8 +34,12 @@ function req(
         path: u.pathname,
         method,
         headers: data
-          ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) }
-          : {},
+          ? {
+              "Content-Type": "application/json",
+              "Content-Length": Buffer.byteLength(data),
+              ...headers,
+            }
+          : headers,
       },
       (res) => {
         const chunks: Buffer[] = [];
@@ -72,10 +78,11 @@ async function waitHealth(maxMs = 8000): Promise<boolean> {
 
 function countClaudeProcs(): number {
   try {
-    const out = execSync(
-      'powershell -Command "(Get-Process claude -ErrorAction SilentlyContinue).Count"',
-      { encoding: "utf-8" }
-    ).trim();
+    const command =
+      process.platform === "win32"
+        ? 'powershell -Command "(Get-Process claude -ErrorAction SilentlyContinue).Count"'
+        : "pgrep -fl '(^|/)claude( |$)' | wc -l";
+    const out = execSync(command, { encoding: "utf-8" }).trim();
     return parseInt(out, 10) || 0;
   } catch {
     return -1;
@@ -165,8 +172,90 @@ async function testCacheAcrossTurns() {
   }
 }
 
+async function testAnthropicMessagesApi() {
+  console.log("\n[Test 2] Anthropic /v1/messages compatibility (PAID)");
+  const apiKey = "integration-secret";
+  const srv = startServer({
+    CC_MAX_SESSIONS: "5",
+    CC_PROXY_API_KEY: apiKey,
+    CC_TURN_TIMEOUT_MS: "180000",
+  });
+  const fileName = `tmp-write-check-${Date.now()}.txt`;
+  const filePath = path.join(PROJECT_ROOT, "test-workspace", fileName);
+  const marker = `WRITE-MARKER-${Date.now()}`;
+  try {
+    if (!(await waitHealth())) {
+      check("server ready", false);
+      return;
+    }
+
+    const unauth = await req("POST", "/v1/messages", {
+      model: "claude-sonnet-4-5",
+      max_tokens: 128,
+      messages: [{ role: "user", content: "hello" }],
+    });
+    check("messages endpoint requires API key", unauth.status === 401, `got ${unauth.status}`);
+
+    const read = await req(
+      "POST",
+      "/v1/messages",
+      {
+        model: "claude-sonnet-4-5",
+        max_tokens: 128,
+        messages: [
+          {
+            role: "user",
+            content: "Read demo.txt and reply with only its unique marker, nothing else.",
+          },
+        ],
+      },
+      { "x-api-key": apiKey }
+    );
+    check("/v1/messages read returns 200", read.status === 200, `got ${read.status}`);
+    const readText = read.json?.content?.[0]?.text;
+    check(
+      "/v1/messages saw downstream read content",
+      typeof readText === "string" && readText.includes("ALPHA-BRAVO-CHARLIE-7742"),
+      `text=${JSON.stringify(readText)}`
+    );
+    check("/v1/messages returns assistant message", read.json?.type === "message");
+    check("/v1/messages returns token usage", (read.json?.usage?.output_tokens || 0) > 0);
+    check(
+      "/v1/messages returns cost metadata",
+      typeof read.json?.usage?.total_cost_usd === "number",
+      `usage=${JSON.stringify(read.json?.usage)}`
+    );
+
+    const write = await req(
+      "POST",
+      "/v1/messages",
+      {
+        model: "claude-sonnet-4-5",
+        max_tokens: 256,
+        messages: [
+          {
+            role: "user",
+            content:
+              `Use the Write tool to create ${fileName} in the current directory ` +
+              `with exactly this content: ${marker}. Then reply with only DONE.`,
+          },
+        ],
+      },
+      { Authorization: `Bearer ${apiKey}` }
+    );
+    check("/v1/messages write returns 200", write.status === 200, `got ${write.status}`);
+    check("write tool created file", fs.existsSync(filePath), filePath);
+    const written = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf-8") : "";
+    check("written file has requested marker", written.includes(marker), `content=${written}`);
+  } finally {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    srv.kill("SIGTERM");
+    await sleep(2000);
+  }
+}
+
 async function testCapacityLimit() {
-  console.log("\n[Test 2] MAX_SESSIONS limit returns 503 (no paid turns)");
+  console.log("\n[Test 3] MAX_SESSIONS limit returns 503 (no paid turns)");
   const srv = startServer({ CC_MAX_SESSIONS: "2" });
   try {
     if (!(await waitHealth())) {
@@ -199,7 +288,7 @@ async function testCapacityLimit() {
 }
 
 async function testIdleReap() {
-  console.log("\n[Test 3] Idle session reaping (no paid turns)");
+  console.log("\n[Test 4] Idle session reaping (no paid turns)");
   const srv = startServer({
     CC_MAX_SESSIONS: "5",
     CC_IDLE_TIMEOUT_MS: "2000",
@@ -232,7 +321,7 @@ async function testIdleReap() {
 }
 
 async function testGracefulShutdown() {
-  console.log("\n[Test 4] Graceful shutdown kills all CLI processes (no paid turns)");
+  console.log("\n[Test 5] Graceful shutdown kills all CLI processes (no paid turns)");
   const before = countClaudeProcs();
   const srv = startServer({ CC_MAX_SESSIONS: "5" });
   if (!(await waitHealth())) {
@@ -258,6 +347,7 @@ async function testGracefulShutdown() {
 async function main() {
   console.log("=== cc-proxy Session Manager Integration Test ===");
   await testCacheAcrossTurns();
+  await testAnthropicMessagesApi();
   await testCapacityLimit();
   await testIdleReap();
   await testGracefulShutdown();

@@ -18,11 +18,53 @@ interface PendingTurn {
 export function resolveClaudeCommand(): string {
   if (process.env.CLAUDE_COMMAND) return process.env.CLAUDE_COMMAND;
 
+  const packageRoot = path.resolve(__dirname, "..", "node_modules", "@anthropic-ai");
+  const nativePackages: string[] = [];
+  if (process.platform === "darwin") {
+    nativePackages.push(
+      process.arch === "arm64"
+        ? "claude-code-darwin-arm64"
+        : "claude-code-darwin-x64"
+    );
+  } else if (process.platform === "linux") {
+    if (process.arch === "arm64") {
+      nativePackages.push("claude-code-linux-arm64-musl", "claude-code-linux-arm64");
+    } else {
+      nativePackages.push("claude-code-linux-x64-musl", "claude-code-linux-x64");
+    }
+  } else if (process.platform === "win32") {
+    nativePackages.push(
+      process.arch === "arm64"
+        ? "claude-code-win32-arm64"
+        : "claude-code-win32-x64"
+    );
+  }
+
+  for (const packageName of nativePackages) {
+    const nativeBin = path.join(packageRoot, packageName, process.platform === "win32" ? "claude.exe" : "claude");
+    if (fs.existsSync(nativeBin)) return nativeBin;
+  }
+
   const binName = process.platform === "win32" ? "claude.cmd" : "claude";
   const localBin = path.resolve(__dirname, "..", "node_modules", ".bin", binName);
   if (fs.existsSync(localBin)) return localBin;
 
   return "claude";
+}
+
+export function resolveClaudeArgs(): string[] {
+  const args = [
+    "-p",
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+  ];
+  if (process.env.CC_CLAUDE_MODEL) {
+    args.push("--model", process.env.CC_CLAUDE_MODEL);
+  }
+  return args;
 }
 
 /**
@@ -44,14 +86,7 @@ export class ClaudeRunner extends EventEmitter {
     if (this.proc) return;
     this.proc = spawn(
       resolveClaudeCommand(),
-      [
-        "-p",
-        "--input-format",
-        "stream-json",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-      ],
+      resolveClaudeArgs(),
       { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"] }
     );
 

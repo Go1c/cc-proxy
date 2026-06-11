@@ -7,9 +7,8 @@ import assert from "node:assert/strict";
 import http from "http";
 import fs from "fs";
 import path from "path";
-import os from "os";
 import { spawn } from "child_process";
-import { resolveClaudeCommand } from "./runner";
+import { resolveClaudeArgs, resolveClaudeCommand } from "./runner";
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const SERVER_SCRIPT = path.join(PROJECT_ROOT, "dist", "server.js");
@@ -17,6 +16,7 @@ const DOWNSTREAM_ROOT = path.join(PROJECT_ROOT, "downstream-project");
 const TEST_WORKSPACE = path.join(PROJECT_ROOT, "test-workspace");
 const PORT = 13456; // Use a non-default port for testing
 const ZEABUR_PORT = 13457;
+const ANTHROPIC_PORT = 13458;
 const BASE_URL = `http://localhost:${PORT}`;
 
 // --- Helpers ---
@@ -52,7 +52,8 @@ function httpGet(
 
 function httpPost(
   url: string,
-  body: unknown
+  body: unknown,
+  headers: Record<string, string> = {}
 ): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
   return new Promise((resolve) => {
     const data = JSON.stringify(body);
@@ -65,6 +66,7 @@ function httpPost(
       headers: {
         "Content-Type": "application/json",
         "Content-Length": Buffer.byteLength(data),
+        ...headers,
       },
     };
     const req = http.request(options, (res) => {
@@ -86,6 +88,41 @@ function httpPost(
       resolve({ status: 0, body: "timeout", headers: {} });
     });
     req.write(data);
+    req.end();
+  });
+}
+
+function httpDelete(
+  url: string,
+  headers: Record<string, string> = {}
+): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
+  return new Promise((resolve) => {
+    const urlObj = new URL(url);
+    const options = {
+      hostname: urlObj.hostname,
+      port: urlObj.port,
+      path: urlObj.pathname,
+      method: "DELETE",
+      headers,
+    };
+    const req = http.request(options, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (c: Buffer) => chunks.push(c));
+      res.on("end", () => {
+        resolve({
+          status: res.statusCode || 0,
+          body: Buffer.concat(chunks).toString("utf-8"),
+          headers: res.headers,
+        });
+      });
+    });
+    req.on("error", (err) =>
+      resolve({ status: 0, body: err.message, headers: {} })
+    );
+    req.setTimeout(5000, () => {
+      req.destroy();
+      resolve({ status: 0, body: "timeout", headers: {} });
+    });
     req.end();
   });
 }
@@ -137,6 +174,23 @@ function readDownstreamFile(relativePath: string): string {
 
 function readServerFile(relativePath: string): string {
   return fs.readFileSync(path.join(TEST_WORKSPACE, relativePath), "utf-8");
+}
+
+async function startTestServer(
+  port: number,
+  env: NodeJS.ProcessEnv
+): Promise<ReturnType<typeof spawn>> {
+  const proc = spawn("node", [SERVER_SCRIPT], {
+    cwd: PROJECT_ROOT,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, ...env, CC_PROXY_PORT: String(port) },
+  });
+  const ready = await waitForServerAt(`http://localhost:${port}`);
+  if (!ready) {
+    proc.kill("SIGKILL");
+    throw new Error(`Server did not start on port ${port}`);
+  }
+  return proc;
 }
 
 // --- Test Suite ---
@@ -199,11 +253,23 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       delete process.env.CLAUDE_COMMAND;
       try {
         const command = resolveClaudeCommand().replace(/\\/g, "/");
-        assert.match(command, /node_modules\/\.bin\/claude(\.cmd)?$/);
+        assert.match(command, /node_modules\/(@anthropic-ai\/claude-code-.+\/claude|\.bin\/claude(\.cmd)?)$/);
         assert.equal(fs.existsSync(command), true);
       } finally {
         if (previousClaudeCommand === undefined) delete process.env.CLAUDE_COMMAND;
         else process.env.CLAUDE_COMMAND = previousClaudeCommand;
+      }
+    });
+
+    it("adds CC_CLAUDE_MODEL to spawned Claude CLI args", () => {
+      const previousModel = process.env.CC_CLAUDE_MODEL;
+      process.env.CC_CLAUDE_MODEL = "claude-test-model";
+      try {
+        const args = resolveClaudeArgs();
+        assert.deepEqual(args.slice(-2), ["--model", "claude-test-model"]);
+      } finally {
+        if (previousModel === undefined) delete process.env.CC_CLAUDE_MODEL;
+        else process.env.CC_CLAUDE_MODEL = previousModel;
       }
     });
 
@@ -237,6 +303,98 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
     it("server responds with Content-Type application/json", async () => {
       const res = await httpGet(`${BASE_URL}/health`);
       assert.equal(res.headers["content-type"], "application/json");
+    });
+  });
+
+  describe("1b. Anthropic-compatible messages API", () => {
+    it("requires an API key for /v1/messages when CC_PROXY_API_KEY is configured", async () => {
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+      });
+      try {
+        const res = await httpPost(`http://localhost:${ANTHROPIC_PORT}/v1/messages`, {
+          model: "claude-sonnet-4-5",
+          max_tokens: 128,
+          messages: [{ role: "user", content: "hello" }],
+        });
+        assert.equal(res.status, 401);
+        const body = JSON.parse(res.body);
+        assert.equal(body.type, "error");
+        assert.equal(body.error.type, "authentication_error");
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+      }
+    });
+
+    it("accepts x-api-key auth for /v1/messages", async () => {
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-5",
+            max_tokens: 128,
+            stream: true,
+            messages: [{ role: "user", content: "hello" }],
+          },
+          { "x-api-key": "test-secret" }
+        );
+        assert.equal(res.status, 400);
+        const body = JSON.parse(res.body);
+        assert.equal(body.type, "error");
+        assert.equal(body.error.type, "invalid_request_error");
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+      }
+    });
+
+    it("accepts Bearer auth for /v1/messages", async () => {
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-5",
+            max_tokens: 128,
+            stream: true,
+            messages: [{ role: "user", content: "hello" }],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 400);
+        const body = JSON.parse(res.body);
+        assert.equal(body.type, "error");
+        assert.equal(body.error.type, "invalid_request_error");
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+      }
+    });
+
+    it("rejects invalid /v1/messages payloads before spawning Claude", async () => {
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          { model: "claude-sonnet-4-5", max_tokens: 128, messages: [] },
+          { "x-api-key": "test-secret" }
+        );
+        assert.equal(res.status, 400);
+        const body = JSON.parse(res.body);
+        assert.equal(body.type, "error");
+        assert.equal(body.error.type, "invalid_request_error");
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+      }
     });
   });
 
