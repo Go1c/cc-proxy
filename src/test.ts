@@ -273,6 +273,22 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       }
     });
 
+    it("adds CC_PERMISSION_MODE to spawned Claude CLI args", () => {
+      const previousModel = process.env.CC_CLAUDE_MODEL;
+      const previousPermissionMode = process.env.CC_PERMISSION_MODE;
+      delete process.env.CC_CLAUDE_MODEL;
+      process.env.CC_PERMISSION_MODE = "acceptEdits";
+      try {
+        const args = resolveClaudeArgs();
+        assert.deepEqual(args.slice(-2), ["--permission-mode", "acceptEdits"]);
+      } finally {
+        if (previousModel === undefined) delete process.env.CC_CLAUDE_MODEL;
+        else process.env.CC_CLAUDE_MODEL = previousModel;
+        if (previousPermissionMode === undefined) delete process.env.CC_PERMISSION_MODE;
+        else process.env.CC_PERMISSION_MODE = previousPermissionMode;
+      }
+    });
+
     it("GET /health returns 200 with status ok", async () => {
       const res = await httpGet(`${BASE_URL}/health`);
       assert.equal(res.status, 200);

@@ -16,6 +16,17 @@ CC_PROXY_API_KEY=<shared out of band>
 
 Do not commit the real key. Configure it in Zeabur as an environment variable and use it locally as either `ANTHROPIC_API_KEY` or an `Authorization` header.
 
+Runtime environment variables:
+
+```text
+CLAUDE_CODE_OAUTH_TOKEN=<Claude Code OAuth token>
+CC_PROXY_API_KEY=<shared proxy API key>
+CLAUDE_COMMAND=/src/node_modules/@anthropic-ai/claude-code-linux-x64/claude
+CC_PERMISSION_MODE=acceptEdits
+```
+
+`CC_PERMISSION_MODE=acceptEdits` is required when `/v1/messages` should allow Claude Code to create or edit files in the session workspace. Without it, read-only validation can still work, but write/edit requests may be denied or silently skipped by Claude Code permissions.
+
 ## How To Use
 
 ### Anthropic-compatible clients
@@ -176,12 +187,14 @@ Node HTTP server (dist/server.js)
   - prevents path traversal out of downstream root,
   - preserves downstream bytes/content for billing-relevant reads.
 - Claude Code built-in tool execution, including `Read` and `Write`.
+- Optional Claude Code permission mode via `CC_PERMISSION_MODE`, including `acceptEdits` for write/edit validation.
 - Anthropic-style `POST /v1/messages`:
   - accepts `x-api-key` and `Authorization: Bearer`,
   - returns `type: "message"`, assistant text content, stop reason and usage,
   - returns cache and cost metadata from Claude Code in `usage`,
   - supports temporary one-shot sessions and optional persistent sessions.
 - Optional model override via `CC_CLAUDE_MODEL`.
+- Optional permission-mode override via `CC_PERMISSION_MODE`.
 
 ## Not Implemented Yet
 
@@ -238,3 +251,20 @@ Successful response should contain:
 ALPHA-BRAVO-CHARLIE-7742
 ```
 
+Long game-development validation prompt:
+
+```bash
+curl -sS https://cc-proxy.zeabur.app/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'Authorization: Bearer <your proxy key>' \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 1600,
+    "messages": [
+      {
+        "role": "user",
+        "content": "You are validating a game development assistant proxy. Read demo.txt and sub/nested.txt from the project. Then write a concise but non-trivial technical review for a small action RPG prototype: combat loop, entity-component design, save/load schema, asset pipeline, performance budget, and automated test plan. Include the exact markers you read from both files, and explain how each marker proves the read hook used downstream project content. Keep the answer grounded in implementation details, not marketing copy."
+      }
+    ]
+  }'
+```

@@ -64,6 +64,9 @@ export function resolveClaudeArgs(): string[] {
   if (process.env.CC_CLAUDE_MODEL) {
     args.push("--model", process.env.CC_CLAUDE_MODEL);
   }
+  if (process.env.CC_PERMISSION_MODE) {
+    args.push("--permission-mode", process.env.CC_PERMISSION_MODE);
+  }
   return args;
 }
 
