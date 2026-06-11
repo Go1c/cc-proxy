@@ -28,9 +28,9 @@ export function resolveClaudeCommand(): string {
     );
   } else if (process.platform === "linux") {
     if (process.arch === "arm64") {
-      nativePackages.push("claude-code-linux-arm64-musl", "claude-code-linux-arm64");
+      nativePackages.push("claude-code-linux-arm64", "claude-code-linux-arm64-musl");
     } else {
-      nativePackages.push("claude-code-linux-x64-musl", "claude-code-linux-x64");
+      nativePackages.push("claude-code-linux-x64", "claude-code-linux-x64-musl");
     }
   } else if (process.platform === "win32") {
     nativePackages.push(
