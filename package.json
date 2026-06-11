@@ -11,9 +11,11 @@
     "test:verbose": "tsc && node --test --test-reporter=spec dist/test.js",
     "test:integration": "tsc && node dist/integration-test.js"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@anthropic-ai/claude-code": "^2.1.173"
+  },
   "devDependencies": {
-    "typescript": "^5.7.0",
-    "@types/node": "^22.0.0"
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
   }
 }

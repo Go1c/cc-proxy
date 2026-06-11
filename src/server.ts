@@ -6,7 +6,7 @@ import { URL } from "url";
 import { HookPayload, PreToolUseOutput } from "./types";
 import { SessionManager, CapacityError, MAX_SESSIONS } from "./session-manager";
 
-const PORT = parseInt(process.env.CC_PROXY_PORT || "3456", 10);
+const PORT = parseInt(process.env.PORT || process.env.CC_PROXY_PORT || "3456", 10);
 const DOWNSTREAM_ROOT = path.resolve(
   process.env.DOWNSTREAM_ROOT || path.join(__dirname, "..", "downstream-project")
 );

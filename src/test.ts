@@ -15,6 +15,7 @@ const SERVER_SCRIPT = path.join(PROJECT_ROOT, "dist", "server.js");
 const DOWNSTREAM_ROOT = path.join(PROJECT_ROOT, "downstream-project");
 const TEST_WORKSPACE = path.join(PROJECT_ROOT, "test-workspace");
 const PORT = 13456; // Use a non-default port for testing
+const ZEABUR_PORT = 13457;
 const BASE_URL = `http://localhost:${PORT}`;
 
 // --- Helpers ---
@@ -89,10 +90,14 @@ function httpPost(
 }
 
 function waitForServer(maxMs = 8_000): Promise<boolean> {
+  return waitForServerAt(BASE_URL, maxMs);
+}
+
+function waitForServerAt(baseUrl: string, maxMs = 8_000): Promise<boolean> {
   const start = Date.now();
   const check = async (): Promise<boolean> => {
     if (Date.now() - start > maxMs) return false;
-    const res = await httpGet(`${BASE_URL}/health`);
+    const res = await httpGet(`${baseUrl}/health`);
     if (res.status === 200) return true;
     await sleep(200);
     return check();
@@ -167,6 +172,27 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
   // 1. Server Health & Infrastructure
   // ========================================
   describe("1. Server health & infrastructure", () => {
+    it("listens on PORT env when CC_PROXY_PORT is absent", async () => {
+      const proc = spawn("node", [SERVER_SCRIPT], {
+        cwd: PROJECT_ROOT,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          PORT: String(ZEABUR_PORT),
+          CC_PROXY_PORT: undefined,
+        },
+      });
+      try {
+        const ready = await waitForServerAt(`http://localhost:${ZEABUR_PORT}`);
+        assert.equal(ready, true);
+        const res = await httpGet(`http://localhost:${ZEABUR_PORT}/health`);
+        assert.equal(res.status, 200);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+      }
+    });
+
     it("GET /health returns 200 with status ok", async () => {
       const res = await httpGet(`${BASE_URL}/health`);
       assert.equal(res.status, 200);
