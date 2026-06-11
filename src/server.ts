@@ -2,6 +2,7 @@ import http from "http";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { randomUUID } from "crypto";
 import { URL } from "url";
 import { HookPayload, PreToolUseOutput } from "./types";
 import { SessionManager, CapacityError, MAX_SESSIONS } from "./session-manager";
@@ -77,7 +78,7 @@ function handlePreToolUse(payload: HookPayload): PreToolUseOutput {
     const result = readFromDownstream(relativePath);
     if (result.ok) {
       // Write downstream content to temp file
-      const tempFile = path.join(TEMP_DIR, `read_${Date.now()}_${path.basename(filePath)}`);
+      const tempFile = path.join(TEMP_DIR, `read_${randomUUID()}_${path.basename(filePath)}`);
       fs.writeFileSync(tempFile, result.content, "utf-8");
       log("INFO", `Wrote downstream content to temp file`, {
         tempFile,

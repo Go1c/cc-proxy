@@ -1,5 +1,7 @@
 import { spawn, ChildProcessWithoutNullStreams } from "child_process";
 import { EventEmitter } from "events";
+import fs from "fs";
+import path from "path";
 import { TurnResult, TurnUsage } from "./types";
 
 const DEFAULT_TURN_TIMEOUT_MS = parseInt(
@@ -11,6 +13,16 @@ interface PendingTurn {
   resolve: (r: TurnResult) => void;
   reject: (e: Error) => void;
   timer: NodeJS.Timeout;
+}
+
+export function resolveClaudeCommand(): string {
+  if (process.env.CLAUDE_COMMAND) return process.env.CLAUDE_COMMAND;
+
+  const binName = process.platform === "win32" ? "claude.cmd" : "claude";
+  const localBin = path.resolve(__dirname, "..", "node_modules", ".bin", binName);
+  if (fs.existsSync(localBin)) return localBin;
+
+  return "claude";
 }
 
 /**
@@ -31,7 +43,7 @@ export class ClaudeRunner extends EventEmitter {
   start(): void {
     if (this.proc) return;
     this.proc = spawn(
-      "claude",
+      resolveClaudeCommand(),
       [
         "-p",
         "--input-format",

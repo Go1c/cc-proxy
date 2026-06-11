@@ -9,6 +9,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { spawn } from "child_process";
+import { resolveClaudeCommand } from "./runner";
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const SERVER_SCRIPT = path.join(PROJECT_ROOT, "dist", "server.js");
@@ -190,6 +191,19 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       } finally {
         proc.kill("SIGKILL");
         await sleep(300);
+      }
+    });
+
+    it("resolves the bundled Claude CLI binary for spawned sessions", () => {
+      const previousClaudeCommand = process.env.CLAUDE_COMMAND;
+      delete process.env.CLAUDE_COMMAND;
+      try {
+        const command = resolveClaudeCommand().replace(/\\/g, "/");
+        assert.match(command, /node_modules\/\.bin\/claude(\.cmd)?$/);
+        assert.equal(fs.existsSync(command), true);
+      } finally {
+        if (previousClaudeCommand === undefined) delete process.env.CLAUDE_COMMAND;
+        else process.env.CLAUDE_COMMAND = previousClaudeCommand;
       }
     });
 
