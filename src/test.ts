@@ -176,6 +176,44 @@ function readServerFile(relativePath: string): string {
   return fs.readFileSync(path.join(TEST_WORKSPACE, relativePath), "utf-8");
 }
 
+function writeFakeClaudeCommand(resultText = "FAKE_STREAM_RESULT"): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `fake-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let idx;
+  while ((idx = buffer.indexOf("\\n")) >= 0) {
+    const line = buffer.slice(0, idx).trim();
+    buffer = buffer.slice(idx + 1);
+    if (!line) continue;
+    process.stdout.write(JSON.stringify({
+      type: "result",
+      session_id: "fake-cli-session",
+      result: ${JSON.stringify(resultText)},
+      usage: {
+        input_tokens: 3,
+        output_tokens: 4,
+        cache_creation_input_tokens: 5,
+        cache_read_input_tokens: 6
+      },
+      total_cost_usd: 0.0123,
+      duration_ms: 10,
+      num_turns: 1,
+      is_error: false
+    }) + "\\n");
+  }
+});
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
 async function startTestServer(
   port: number,
   env: NodeJS.ProcessEnv
@@ -353,8 +391,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
           {
             model: "claude-sonnet-4-5",
             max_tokens: 128,
-            stream: true,
-            messages: [{ role: "user", content: "hello" }],
+            messages: [],
           },
           { "x-api-key": "test-secret" }
         );
@@ -378,8 +415,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
           {
             model: "claude-sonnet-4-5",
             max_tokens: 128,
-            stream: true,
-            messages: [{ role: "user", content: "hello" }],
+            messages: [],
           },
           { Authorization: "Bearer test-secret" }
         );
@@ -390,6 +426,38 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       } finally {
         proc.kill("SIGKILL");
         await sleep(300);
+      }
+    });
+
+    it("returns Anthropic SSE events for stream:true /v1/messages requests", async () => {
+      const fakeClaude = writeFakeClaudeCommand("FAKE_STREAM_RESULT");
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-5",
+            max_tokens: 128,
+            stream: true,
+            messages: [{ role: "user", content: "hello" }],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200);
+        assert.match(String(res.headers["content-type"]), /^text\/event-stream/);
+        assert.match(res.body, /event: message_start/);
+        assert.match(res.body, /event: content_block_delta/);
+        assert.match(res.body, /event: message_delta/);
+        assert.match(res.body, /event: message_stop/);
+        assert.match(res.body, /FAKE_STREAM_RESULT/);
+        assert.match(res.body, /"total_cost_usd":0.0123/);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
       }
     });
 

@@ -78,6 +78,14 @@ Expected text content for the bundled validation project:
 ALPHA-BRAVO-CHARLIE-7742
 ```
 
+Streaming clients:
+
+```text
+stream: true
+```
+
+The proxy supports Anthropic-style Server-Sent Events for clients that require streaming. The underlying Claude Code turn is still executed as a real Claude Code request; the proxy currently sends the resulting assistant text as a buffered SSE response rather than token-by-token live streaming.
+
 ### Persistent cache sessions
 
 By default, `/v1/messages` creates a temporary Claude Code session for one request and closes it after the turn.
@@ -191,6 +199,7 @@ Node HTTP server (dist/server.js)
 - Anthropic-style `POST /v1/messages`:
   - accepts `x-api-key` and `Authorization: Bearer`,
   - returns `type: "message"`, assistant text content, stop reason and usage,
+  - supports `stream: true` using Anthropic-style buffered SSE events,
   - returns cache and cost metadata from Claude Code in `usage`,
   - supports temporary one-shot sessions and optional persistent sessions.
 - Optional model override via `CC_CLAUDE_MODEL`.
@@ -198,7 +207,7 @@ Node HTTP server (dist/server.js)
 
 ## Not Implemented Yet
 
-- Streaming responses (`stream: true`) are rejected with `invalid_request_error`.
+- Token-by-token live streaming is not implemented. `stream: true` clients receive Anthropic-style SSE events after the Claude Code turn completes.
 - Full Anthropic tool-use protocol is not implemented. Client-supplied `tools` are included as prompt context, but the proxy does not return `tool_use` blocks or execute client function tools.
 - Multimodal content is not natively handled. Non-text content blocks are serialized into prompt text.
 - `/v1/messages` does not currently pass the request `model` field through to Claude Code. The response echoes the requested model for SDK compatibility; the actual Claude Code model is selected by Claude Code or `CC_CLAUDE_MODEL`.

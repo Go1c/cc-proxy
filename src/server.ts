@@ -199,9 +199,6 @@ function buildPromptFromAnthropicMessages(body: any):
   if (!body || typeof body !== "object") {
     return { ok: false, message: "Request body must be a JSON object" };
   }
-  if (body.stream === true) {
-    return { ok: false, message: "Streaming is not supported by this proxy yet" };
-  }
   if (typeof body.model !== "string" || !body.model) {
     return { ok: false, message: "Missing required string field 'model'" };
   }
@@ -231,6 +228,88 @@ function buildPromptFromAnthropicMessages(body: any):
   }
 
   return { ok: true, prompt: parts.join("\n\n"), model: body.model };
+}
+
+function makeAnthropicMessage(model: string, result: any): any {
+  return {
+    id: `msg_${randomUUID().replace(/-/g, "")}`,
+    type: "message",
+    role: "assistant",
+    model,
+    content: [{ type: "text", text: result.result }],
+    stop_reason: "end_turn",
+    stop_sequence: null,
+    usage: {
+      input_tokens: result.usage.input_tokens,
+      output_tokens: result.usage.output_tokens,
+      cache_creation_input_tokens: result.usage.cache_creation_input_tokens,
+      cache_read_input_tokens: result.usage.cache_read_input_tokens,
+      total_cost_usd: result.usage.total_cost_usd,
+    },
+  };
+}
+
+function sendSseEvent(res: http.ServerResponse, event: string, data: unknown): void {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function sendAnthropicStream(
+  res: http.ServerResponse,
+  message: any,
+  headers: Record<string, string>
+): void {
+  res.writeHead(200, {
+    ...headers,
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+
+  sendSseEvent(res, "message_start", {
+    type: "message_start",
+    message: {
+      id: message.id,
+      type: "message",
+      role: "assistant",
+      model: message.model,
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: {
+        input_tokens: message.usage.input_tokens,
+        output_tokens: 0,
+        cache_creation_input_tokens: message.usage.cache_creation_input_tokens,
+        cache_read_input_tokens: message.usage.cache_read_input_tokens,
+        total_cost_usd: message.usage.total_cost_usd,
+      },
+    },
+  });
+  sendSseEvent(res, "content_block_start", {
+    type: "content_block_start",
+    index: 0,
+    content_block: { type: "text", text: "" },
+  });
+  sendSseEvent(res, "content_block_delta", {
+    type: "content_block_delta",
+    index: 0,
+    delta: { type: "text_delta", text: message.content[0].text },
+  });
+  sendSseEvent(res, "content_block_stop", {
+    type: "content_block_stop",
+    index: 0,
+  });
+  sendSseEvent(res, "message_delta", {
+    type: "message_delta",
+    delta: { stop_reason: "end_turn", stop_sequence: null },
+    usage: {
+      output_tokens: message.usage.output_tokens,
+      total_cost_usd: message.usage.total_cost_usd,
+    },
+  });
+  sendSseEvent(res, "message_stop", { type: "message_stop" });
+  res.end();
 }
 
 async function handleAnthropicMessages(
@@ -287,27 +366,12 @@ async function handleAnthropicMessages(
     };
     if (!closeAfterTurn) responseHeaders["x-cc-session-id"] = sessionId;
 
-    sendJson(
-      res,
-      200,
-      {
-        id: `msg_${randomUUID().replace(/-/g, "")}`,
-        type: "message",
-        role: "assistant",
-        model: promptResult.model,
-        content: [{ type: "text", text: result.result }],
-        stop_reason: "end_turn",
-        stop_sequence: null,
-        usage: {
-          input_tokens: result.usage.input_tokens,
-          output_tokens: result.usage.output_tokens,
-          cache_creation_input_tokens: result.usage.cache_creation_input_tokens,
-          cache_read_input_tokens: result.usage.cache_read_input_tokens,
-          total_cost_usd: result.usage.total_cost_usd,
-        },
-      },
-      responseHeaders
-    );
+    const message = makeAnthropicMessage(promptResult.model, result);
+    if (body.stream === true) {
+      sendAnthropicStream(res, message, responseHeaders);
+    } else {
+      sendJson(res, 200, message, responseHeaders);
+    }
   } catch (err: any) {
     if (err instanceof CapacityError) {
       sendAnthropicError(res, 503, "api_error", err.message);
