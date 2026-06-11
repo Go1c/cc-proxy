@@ -1,0 +1,2 @@
+This file only exists on the server, not downstream.
+SERVER_ONLY_MARKER

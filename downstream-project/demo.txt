@@ -1,0 +1,5 @@
+DOWNSTREAM_REAL_CONTENT
+This is the actual file from the user's local project.
+It contains important data that only exists downstream.
+The quick brown fox jumps over the lazy dog.
+Line 5 of the downstream file has a unique marker: ALPHA-BRAVO-CHARLIE-7742

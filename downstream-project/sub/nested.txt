@@ -1,0 +1,3 @@
+NESTED_DOWNSTREAM_FILE
+This file is in a subdirectory.
+Unique marker: DELTA-ECHO-FOXTROT-3355

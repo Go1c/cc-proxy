@@ -1,0 +1,6 @@
+UNICODE_TEST_FILE
+Chinese: 你好世界
+Japanese: こんにちは
+Emoji markers: 🎯UNICODE_MARKER🎯
+Arabic: مرحبا
+Russian: Привет мир
