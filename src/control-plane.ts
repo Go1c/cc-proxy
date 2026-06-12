@@ -98,6 +98,21 @@ export class ControlPlane {
     return { token: this.issueAdminToken(admin.username), username: admin.username };
   }
 
+  changeAdminPassword(currentPassword: string, newPassword: string): { token: string; username: string } {
+    const admin = this.state.admin;
+    if (!admin) throw new Error("admin is not configured");
+    if (!verifySecret(currentPassword, admin.password_salt, admin.password_hash)) {
+      throw new Error("current password is incorrect");
+    }
+    validatePassword(newPassword);
+    const salt = randomBytes(16).toString("hex");
+    admin.password_salt = salt;
+    admin.password_hash = hashSecret(newPassword, salt);
+    this.adminTokens.clear();
+    this.save();
+    return { token: this.issueAdminToken(admin.username), username: admin.username };
+  }
+
   verifyAdminToken(token: string): boolean {
     const record = this.adminTokens.get(token);
     if (!record) return false;

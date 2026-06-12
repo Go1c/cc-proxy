@@ -661,6 +661,23 @@
             <button id="loginButton" type="button">登录</button>
             <button class="secondary" id="setupButton" type="button">初始化</button>
           </div>
+          <details>
+            <summary>修改管理员密码</summary>
+            <div class="form-grid one">
+              <label>当前密码
+                <input id="currentAdminPassword" type="password" autocomplete="current-password">
+              </label>
+              <label>新密码
+                <input id="newAdminPassword" type="password" autocomplete="new-password">
+              </label>
+              <label>确认新密码
+                <input id="confirmAdminPassword" type="password" autocomplete="new-password">
+              </label>
+            </div>
+            <div class="actions" style="margin-top: 12px;">
+              <button class="secondary" id="changeAdminPasswordButton" type="button">修改密码</button>
+            </div>
+          </details>
           <div class="notice" id="authNotice"></div>
         </section>
 
@@ -903,6 +920,28 @@
       setNotice("authNotice", "已退出");
       stopAuthPolling();
       loadAdminStatus(false).catch(() => {});
+    }
+
+    async function changeAdminPassword() {
+      const currentPassword = $("currentAdminPassword").value;
+      const newPassword = $("newAdminPassword").value;
+      const confirmPassword = $("confirmAdminPassword").value;
+      if (newPassword !== confirmPassword) {
+        throw new Error("两次输入的新密码不一致");
+      }
+      const body = await api("/admin/auth/password", {
+        method: "PATCH",
+        body: JSON.stringify({
+          current_password: currentPassword,
+          new_password: newPassword,
+        }),
+      });
+      setToken(body.token);
+      $("currentAdminPassword").value = "";
+      $("newAdminPassword").value = "";
+      $("confirmAdminPassword").value = "";
+      setNotice("authNotice", "管理员密码已修改，旧会话已失效", "ok");
+      await loadLogs();
     }
 
     async function loadAdminStatus(updateNotice = true) {
@@ -1322,6 +1361,7 @@
 
     $("setupButton").onclick = () => runAction(() => authenticate("/admin/setup"));
     $("loginButton").onclick = () => runAction(() => authenticate("/admin/auth/login"));
+    $("changeAdminPasswordButton").onclick = () => runAction(changeAdminPassword);
     $("logoutButton").onclick = logout;
     $("saveConfigButton").onclick = () => runAction(saveConfig);
     $("claudeLoginButton").onclick = () => runAction(() => startClaudeAuth("/admin/claude-auth/login"), "claudeAuthNotice");

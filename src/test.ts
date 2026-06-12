@@ -1992,6 +1992,59 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       }
     });
 
+    it("changes the administrator password from the admin backend and invalidates old sessions", async () => {
+      const dataDir = makeIsolatedDataDir("admin-password-change");
+      const proc = await startTestServer(ZEABUR_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+      });
+      try {
+        const baseUrl = `http://localhost:${ZEABUR_PORT}`;
+        const oldToken = await bootstrapAdmin(baseUrl, "admin", "admin-secret");
+
+        const changed = await httpPatch(
+          `${baseUrl}/admin/auth/password`,
+          {
+            current_password: "admin-secret",
+            new_password: "admin-secret-2",
+          },
+          { Authorization: `Bearer ${oldToken}` }
+        );
+        assert.equal(changed.status, 200, changed.body);
+        const changedBody = JSON.parse(changed.body);
+        assert.match(changedBody.token, /^adm_/);
+
+        const oldSessionConfig = await httpGet(`${baseUrl}/admin/config`, {
+          Authorization: `Bearer ${oldToken}`,
+        });
+        assert.equal(oldSessionConfig.status, 401, oldSessionConfig.body);
+
+        const oldLogin = await httpPost(`${baseUrl}/admin/auth/login`, {
+          username: "admin",
+          password: "admin-secret",
+        });
+        assert.equal(oldLogin.status, 401, oldLogin.body);
+
+        const newLogin = await httpPost(`${baseUrl}/admin/auth/login`, {
+          username: "admin",
+          password: "admin-secret-2",
+        });
+        assert.equal(newLogin.status, 200, newLogin.body);
+
+        const logs = await httpGet(`${baseUrl}/admin/logs`, {
+          Authorization: `Bearer ${changedBody.token}`,
+        });
+        assert.equal(logs.status, 200, logs.body);
+        const logsBody = JSON.parse(logs.body);
+        assert.ok(
+          logsBody.logs.some((entry: any) => entry.event === "admin.password.changed"),
+          "admin logs should include password changes"
+        );
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+      }
+    });
+
     it("shows service runtime logs in the admin backend", async () => {
       const dataDir = makeIsolatedDataDir("admin-service-runtime-logs");
       const proc = await startTestServer(ZEABUR_PORT, {
@@ -2096,6 +2149,8 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.match(res.body, /claudeAuthInput/);
         assert.match(res.body, /\/admin\/claude-auth\/input/);
         assert.match(res.body, /cancelClaudeAuthButton/);
+        assert.match(res.body, /changeAdminPasswordButton/);
+        assert.match(res.body, /\/admin\/auth\/password/);
         assert.match(res.body, /copyCreatedKeyButton/);
         assert.match(res.body, /logLevelFilter/);
         assert.match(res.body, /storageDataDir/);

@@ -1285,6 +1285,25 @@ async function handleAdminRequest(
     return true;
   }
 
+  if (req.method === "PATCH" && pathname === "/admin/auth/password") {
+    try {
+      const body = await readJsonBody(req);
+      const result = controlPlane.changeAdminPassword(
+        String(body.current_password || ""),
+        String(body.new_password || "")
+      );
+      auditLog.record("warn", "admin.password.changed", "Administrator password changed", {
+        username: result.username,
+      });
+      sendJson(res, 200, result);
+    } catch (err: any) {
+      sendJson(res, err.message?.includes("incorrect") ? 401 : 400, {
+        error: err.message || "invalid password change request",
+      });
+    }
+    return true;
+  }
+
   if (req.method === "GET" && pathname === "/admin/api-keys") {
     sendJson(res, 200, { keys: controlPlane.listApiKeys() });
     return true;
