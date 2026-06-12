@@ -851,6 +851,25 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       }
     });
 
+    it("adds CC_CLAUDE_SETTING_SOURCES to spawned Claude CLI args", () => {
+      const previousSettingSources = process.env.CC_CLAUDE_SETTING_SOURCES;
+      process.env.CC_CLAUDE_SETTING_SOURCES = "project,local";
+      try {
+        const args = resolveClaudeArgs();
+        assert.ok(
+          args.includes("--setting-sources"),
+          "Claude CLI args should include setting source override"
+        );
+        assert.equal(args[args.indexOf("--setting-sources") + 1], "project,local");
+      } finally {
+        if (previousSettingSources === undefined) {
+          delete process.env.CC_CLAUDE_SETTING_SOURCES;
+        } else {
+          process.env.CC_CLAUDE_SETTING_SOURCES = previousSettingSources;
+        }
+      }
+    });
+
     it("enables Claude Code partial stream-json messages for live SSE", () => {
       const args = resolveClaudeArgs();
       assert.ok(

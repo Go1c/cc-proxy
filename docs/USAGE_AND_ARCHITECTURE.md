@@ -29,6 +29,14 @@ CC_MAX_SESSIONS=10
 
 `CC_PERMISSION_MODE=acceptEdits` is required when `/v1/messages` should allow Claude Code to create or edit files in the session workspace. Without it, read-only validation can still work, but write/edit requests may be denied or silently skipped by Claude Code permissions.
 
+Optional isolation variable:
+
+```text
+CC_CLAUDE_SETTING_SOURCES=project,local
+```
+
+This forwards Claude Code's `--setting-sources` flag. Use it only when a machine has user-level Claude Code settings that should not affect the proxy runtime. Do not set it unless you have confirmed the runtime still has a valid `CLAUDE_CODE_OAUTH_TOKEN`; setting sources can change which local configuration files Claude Code reads, but it does not create authentication.
+
 Do not configure `CC_ANTHROPIC_API_KEY`, `CC_ANTHROPIC_BASE_URL`, `CC_ANTHROPIC_AUTH_HEADER`, `CC_ANTHROPIC_BETA`, or `CC_ANTHROPIC_VERSION` for this deployment. The goal is to use Claude Code OAuth/subscription quota through the real Claude Code CLI, not Anthropic API usage credits.
 
 ## Zeabur Claude Code OAuth Flow
@@ -510,6 +518,7 @@ Node HTTP server (dist/server.js)
 - Very small image inputs can be rejected by the underlying Claude Code/API image processor. A normal 64x64 PNG image passed through `/v1/messages` and returned `Red` in production.
 - Claude Code reports high token counts because each Claude Code CLI request includes its own tool/runtime/system context. This is expected for the Claude Code OAuth path and is not the same as a minimal Anthropic API request.
 - `usage.total_cost_usd` is surfaced from Claude Code result events for visibility, but this deployment is authenticated by `CLAUDE_CODE_OAUTH_TOKEN`; do not add Anthropic API upstream credentials unless the billing model intentionally changes.
+- If local validation unexpectedly calls a remote proxy or custom Anthropic base URL, check user-level Claude Code settings and rerun with `CC_CLAUDE_SETTING_SOURCES=project,local` plus a valid `CLAUDE_CODE_OAUTH_TOKEN`.
 
 ## Zeabur Deployment Notes
 
@@ -570,6 +579,14 @@ GET /health -> 200, max_sessions=10
 POST /v1/messages -> blocked until Claude Code OAuth is refreshed; current Pod token returns Claude CLI 401 Invalid bearer token
 ```
 
+Current local real-Claude validation status as of 2026-06-12:
+
+```text
+Isolated local server with real Claude Code CLI starts and serves /health
+POST /v1/messages invalid messages -> 400, request-id header matches body request_id
+POST /v1/messages inference -> blocked by local Claude CLI 401 Invalid bearer token unless a fresh valid CLAUDE_CODE_OAUTH_TOKEN is supplied
+```
+
 Previous verified production run on 2026-06-12 before the token refresh issue:
 
 ```text
@@ -595,12 +612,12 @@ npm test
 Latest local result:
 
 ```text
-tests 72
-pass 72
+tests 73
+pass 73
 fail 0
 ```
 
-Local coverage includes fake-Claude HTTP tests for request-id headers, live stream chunks, multimodal native blocks, assistant history preservation, cache metadata, client-supplied MCP tools, tool edge cases, and long game-development context passthrough.
+Local coverage includes fake-Claude HTTP tests for request-id headers, live stream chunks, multimodal native blocks, assistant history preservation, cache metadata, client-supplied MCP tools, tool edge cases, long game-development context passthrough, and Claude CLI setting-source argument forwarding.
 
 Real paid integration test:
 

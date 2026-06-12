@@ -28,6 +28,7 @@ export interface ClaudeRunnerOptions {
   model?: string;
   permissionMode?: string;
   effort?: string;
+  settingSources?: string;
   mcpConfig?: string;
   strictMcpConfig?: boolean;
   allowedTools?: string[];
@@ -95,6 +96,10 @@ export function resolveClaudeArgs(options: ClaudeRunnerOptions = {}): string[] {
   const effort = options.effort || process.env.CC_CLAUDE_EFFORT;
   if (effort) {
     args.push("--effort", effort);
+  }
+  const settingSources = options.settingSources || process.env.CC_CLAUDE_SETTING_SOURCES;
+  if (settingSources) {
+    args.push("--setting-sources", settingSources);
   }
   if (options.mcpConfig) {
     args.push("--mcp-config", options.mcpConfig);
