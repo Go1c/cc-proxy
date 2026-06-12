@@ -611,7 +611,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
           {
             model: "claude-sonnet-4-6",
             max_tokens: 1024,
-            thinking: { type: "enabled", budget_tokens: 1024 },
+            thinking: { type: "enabled", budget_tokens: 512 },
             messages: [
               {
                 role: "user",
@@ -630,7 +630,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.equal(upstream.requests.length, 1);
         assert.deepEqual(upstream.requests[0].body.thinking, {
           type: "enabled",
-          budget_tokens: 1024,
+          budget_tokens: 512,
         });
       } finally {
         proc.kill("SIGKILL");
