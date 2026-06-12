@@ -17,6 +17,7 @@ export interface StartClaudeAuthJobOptions {
   command: string;
   args: string[];
   cwd: string;
+  env?: NodeJS.ProcessEnv;
 }
 
 const MAX_LOG_CHARS = 64 * 1024;
@@ -55,6 +56,7 @@ export class ClaudeAuthJob {
     const proc = spawn(command, options.args, {
       cwd: options.cwd,
       stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, ...(options.env || {}) },
     });
     this.proc = proc;
     proc.stdout?.on("data", (chunk) => this.appendLog(chunk));

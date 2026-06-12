@@ -34,11 +34,13 @@ const SESSION_CWD = path.resolve(
 );
 const TEMP_DIR = path.join(os.tmpdir(), "cc-proxy");
 const DATA_DIR = path.resolve(process.env.CC_PROXY_DATA_DIR || path.join(process.cwd(), ".cc-proxy-data"));
+const CLAUDE_HOME_DIR = path.join(DATA_DIR, "claude-home");
 const LEGACY_CLIENT_API_KEY = process.env.CC_PROXY_API_KEY || "";
 
 // Ensure temp dir exists
 fs.mkdirSync(TEMP_DIR, { recursive: true });
 fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(CLAUDE_HOME_DIR, { recursive: true });
 
 const controlPlane = new ControlPlane(path.join(DATA_DIR, "control-plane.json"));
 const auditLog = new AuditLog(path.join(DATA_DIR, "audit-log.json"));
@@ -375,6 +377,7 @@ function claudeRunnerOptionsFromConfig(
     effort: overrides.effort || config.claude_effort || undefined,
     settingSources:
       overrides.settingSources || config.claude_setting_sources || undefined,
+    env: { ...(overrides.env || {}), HOME: CLAUDE_HOME_DIR },
     mcpConfig: overrides.mcpConfig,
     strictMcpConfig: overrides.strictMcpConfig,
     allowedTools: overrides.allowedTools,
@@ -1361,6 +1364,7 @@ async function handleAdminRequest(
         command: resolveClaudeCommand(config.claude_command || undefined),
         args: splitCommandArgs(config.claude_auth_login_args || "login"),
         cwd: SESSION_CWD,
+        env: { HOME: CLAUDE_HOME_DIR },
       });
       auditLog.record("info", "claude_auth.login.started", "Claude account login job started", {
         command: snapshot.command,
@@ -1382,6 +1386,7 @@ async function handleAdminRequest(
         command: resolveClaudeCommand(config.claude_command || undefined),
         args: splitCommandArgs(config.claude_auth_status_args || "--version"),
         cwd: SESSION_CWD,
+        env: { HOME: CLAUDE_HOME_DIR },
       });
       auditLog.record("info", "claude_auth.check.started", "Claude account auth check job started", {
         command: snapshot.command,

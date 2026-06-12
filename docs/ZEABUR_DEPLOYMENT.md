@@ -45,6 +45,7 @@ CC_PROXY_DATA_DIR=/data/cc-proxy
 - 运行配置。
 - 后台日志。
 - Claude 账号状态和用量统计。
+- Claude CLI 登录态，路径是 `/data/cc-proxy/claude-home`。
 
 不挂持久化卷的话，重建/重新部署后这些数据可能丢失。
 
@@ -158,5 +159,5 @@ curl https://你的域名/health
 
 - `/admin` 500：镜像里缺 `public/admin.html`，检查 Dockerfile 是否有 `COPY public ./public`。
 - 重部署后管理员/key 丢失：没有挂载 `/data` 或没有设置 `CC_PROXY_DATA_DIR=/data/cc-proxy`。
-- Claude 未登录：进 `/admin` 的 Claude Auth 执行登录/检查，或确认 Zeabur 容器内 Claude CLI 能保存登录态到持久目录。
+- Claude 未登录：进 `/admin` 的 Claude Auth 执行登录/检查，并确认 `/data/cc-proxy/claude-home` 在持久化卷里。
 - 下游 401：必须使用后台 API Keys 新建出来的 key。

@@ -46,6 +46,7 @@ export interface ClaudeRunnerOptions {
   permissionMode?: string;
   effort?: string;
   settingSources?: string;
+  env?: NodeJS.ProcessEnv;
   mcpConfig?: string;
   strictMcpConfig?: boolean;
   allowedTools?: string[];
@@ -154,7 +155,11 @@ export class ClaudeRunner extends EventEmitter {
     this.proc = spawn(
       resolveClaudeCommand(this.options.command),
       resolveClaudeArgs(this.options),
-      { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"] }
+      {
+        cwd: this.cwd,
+        stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env, ...(this.options.env || {}) },
+      }
     );
 
     this.proc.stdout.on("data", (c: Buffer) => this.onStdout(c));

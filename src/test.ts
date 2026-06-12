@@ -332,6 +332,26 @@ async function waitForFile(filePath: string, timeoutMs = 2_000): Promise<boolean
   return fs.existsSync(filePath);
 }
 
+async function waitForJsonFile(filePath: string, timeoutMs = 2_000): Promise<any | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(filePath)) {
+      try {
+        return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+      } catch {
+        /* file may be visible before the child process finishes writing */
+      }
+    }
+    await sleep(25);
+  }
+  if (!fs.existsSync(filePath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
 function makeIsolatedDataDir(name: string): string {
   const safeName = name.replace(/[^a-z0-9_-]/gi, "-").toLowerCase();
   const dir = path.join(
@@ -420,6 +440,29 @@ function writeArgRecordingClaudeCommand(argsPath: string): string {
     `#!/usr/bin/env node
 const fs = require("fs");
 fs.writeFileSync(${JSON.stringify(argsPath)}, JSON.stringify(process.argv.slice(2)), "utf8");
+process.stdin.resume();
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
+function writeEnvRecordingClaudeCommand(envPath: string, exitAfterStart = false): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `env-recording-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+const fs = require("fs");
+fs.writeFileSync(${JSON.stringify(envPath)}, JSON.stringify({
+  HOME: process.env.HOME || "",
+  XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME || "",
+  args: process.argv.slice(2)
+}), "utf8");
+if (${exitAfterStart}) {
+  process.stdout.write("Claude login URL: https://claude.example/login\\n");
+  process.exit(0);
+}
 process.stdin.resume();
 `,
     "utf-8"
@@ -1317,6 +1360,37 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       }
     });
 
+    it("runs spawned Claude windows with a persistent data-dir HOME", async () => {
+      const dataDir = makeIsolatedDataDir("claude-runner-persistent-home");
+      const envPath = path.join(dataDir, "claude-env.json");
+      const fakeClaude = writeEnvRecordingClaudeCommand(envPath);
+      const proc = await startTestServer(ZEABUR_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const baseUrl = `http://localhost:${ZEABUR_PORT}`;
+        const adminToken = await bootstrapAdmin(baseUrl);
+        const clientKey = await createDownstreamKey(baseUrl, adminToken, "persistent-home-client");
+        const clientAuth = { Authorization: `Bearer ${clientKey.value}` };
+
+        const created = await httpPost(`${baseUrl}/sessions`, {}, clientAuth);
+        assert.equal(created.status, 201, created.body);
+
+        const env = await waitForJsonFile(envPath);
+        assert.ok(env, "Claude env file was not written");
+        assert.equal(env.HOME, path.join(dataDir, "claude-home"));
+        assert.equal(fs.existsSync(env.HOME), true);
+
+        const createdBody = JSON.parse(created.body);
+        await httpDelete(`${baseUrl}/sessions/${createdBody.id}`, clientAuth);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
     it("runs Claude account login from the admin backend and exposes auth logs", async () => {
       const dataDir = makeIsolatedDataDir("admin-claude-auth-login");
       const argsPath = path.join(dataDir, "claude-auth-args.json");
@@ -1364,6 +1438,46 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.equal(authBody.auth.exit_code, 0);
         assert.match(authBody.auth.log, /Claude login URL/);
         assert.match(authBody.auth.log, /waiting for browser confirmation/);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("runs Claude account login with the same persistent data-dir HOME", async () => {
+      const dataDir = makeIsolatedDataDir("claude-auth-persistent-home");
+      const envPath = path.join(dataDir, "claude-auth-env.json");
+      const fakeClaude = writeEnvRecordingClaudeCommand(envPath, true);
+      const proc = await startTestServer(ZEABUR_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const baseUrl = `http://localhost:${ZEABUR_PORT}`;
+        const adminToken = await bootstrapAdmin(baseUrl);
+
+        const updated = await httpPut(
+          `${baseUrl}/admin/config`,
+          {
+            claude_command: fakeClaude,
+            claude_auth_login_args: "auth login --browser",
+          },
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(updated.status, 200, updated.body);
+
+        const started = await httpPost(
+          `${baseUrl}/admin/claude-auth/login`,
+          {},
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(started.status, 202, started.body);
+
+        const env = await waitForJsonFile(envPath);
+        assert.ok(env, "Claude auth env file was not written");
+        assert.equal(env.HOME, path.join(dataDir, "claude-home"));
+        assert.equal(fs.existsSync(env.HOME), true);
       } finally {
         proc.kill("SIGKILL");
         await sleep(300);
