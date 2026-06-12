@@ -24,9 +24,20 @@ CC_PROXY_API_KEY=<shared proxy API key>
 CLAUDE_COMMAND=/src/node_modules/@anthropic-ai/claude-code-linux-x64/claude
 CC_CLAUDE_MODEL=claude-sonnet-4-6
 CC_PERMISSION_MODE=acceptEdits
+CC_MAX_SESSIONS=10
 ```
 
 `CC_PERMISSION_MODE=acceptEdits` is required when `/v1/messages` should allow Claude Code to create or edit files in the session workspace. Without it, read-only validation can still work, but write/edit requests may be denied or silently skipped by Claude Code permissions.
+
+Do not configure `CC_ANTHROPIC_API_KEY`, `CC_ANTHROPIC_BASE_URL`, `CC_ANTHROPIC_AUTH_HEADER`, `CC_ANTHROPIC_BETA`, or `CC_ANTHROPIC_VERSION` for this deployment. The goal is to use Claude Code OAuth/subscription quota through the real Claude Code CLI, not Anthropic API usage credits.
+
+Current Zeabur runtime patch:
+
+```text
+cc-proxy-dist ConfigMap -> /src/dist
+```
+
+Mount the full compiled `dist` directory. Do not mount only `/src/dist/server.js`; `server.js`, `runner.js`, `session-manager.js`, and `types.js` must come from the same build.
 
 ## How To Use
 
@@ -208,6 +219,22 @@ Node HTTP server (dist/server.js)
   - supports temporary one-shot sessions and optional persistent sessions.
 - Optional model override via `CC_CLAUDE_MODEL`.
 - Optional permission-mode override via `CC_PERMISSION_MODE`.
+- Production deployment with `cc-proxy-dist` mounted over `/src/dist`, so all runtime modules match the local build.
+
+## Completed Work
+
+- Reverted the Anthropic API upstream backend so requests no longer use API credits.
+- Restored `/v1/messages` to route through the real Claude Code CLI using OAuth/subscription quota.
+- Added Anthropic-compatible `POST /v1/messages` auth through `x-api-key` and `Authorization: Bearer`.
+- Added buffered `stream: true` SSE compatibility.
+- Preserved Claude Code stream-json assistant blocks, including `thinking` and `signature`.
+- Preserved native input blocks passed to Claude Code, including text, image, document, tool_result, and assistant history blocks.
+- Added `CC_CLAUDE_MODEL=claude-sonnet-4-6` CLI model override.
+- Added `CC_PERMISSION_MODE=acceptEdits` CLI permission override.
+- Set production `CC_MAX_SESSIONS=10`.
+- Removed production `CC_ANTHROPIC_*` environment variables.
+- Fixed the Zeabur deployment mismatch where only `server.js` was mounted and the old image `runner.js` was still used.
+- Verified production text, stream, image, long-context game-development prompts, Read hook markers, persistent sessions, and cache metadata.
 
 ## Not Implemented Yet
 
@@ -220,7 +247,94 @@ Node HTTP server (dist/server.js)
 - There is no per-user key management; `CC_PROXY_API_KEY` is a single shared proxy key.
 - The hook currently intercepts `Read`; writes happen in the Claude Code session workspace and are not mirrored back into `DOWNSTREAM_ROOT`.
 
+## TODO
+
+- Implement live token-by-token streaming from Claude Code events instead of buffered SSE.
+- Implement real client-supplied Anthropic tool protocol support:
+  - accept `tools`,
+  - emit `tool_use`,
+  - accept follow-up `tool_result`,
+  - preserve `tool_choice` semantics where possible.
+- Map Anthropic `thinking` request options to an appropriate Claude Code effort/config path if Claude Code exposes a stable interface.
+- Decide whether per-request `model` should override the CLI model or remain deployment-controlled by `CC_CLAUDE_MODEL`.
+- Improve Anthropic-compatible response headers and error shapes, including request IDs.
+- Add per-user or per-client API keys instead of one shared `CC_PROXY_API_KEY`.
+- Add explicit production rate limiting beyond `CC_MAX_SESSIONS`.
+- Decide how write/edit results should sync back to a real downstream workspace in a remote-agent architecture.
+- Add a repeatable production deployment script for the `cc-proxy-dist` ConfigMap patch.
+- Add cctest coverage for long context, streaming, multimodal images, assistant history, cache reuse, and tool-call edge cases.
+
+## Known Edge Cases
+
+- Very small image inputs can be rejected by the underlying Claude Code/API image processor. A normal 64x64 PNG image passed through `/v1/messages` and returned `Red` in production.
+- Claude Code reports high token counts because each Claude Code CLI request includes its own tool/runtime/system context. This is expected for the Claude Code OAuth path and is not the same as a minimal Anthropic API request.
+- `usage.total_cost_usd` is surfaced from Claude Code result events for visibility, but this deployment is authenticated by `CLAUDE_CODE_OAUTH_TOKEN`; do not add Anthropic API upstream credentials unless the billing model intentionally changes.
+
+## Zeabur Deployment Notes
+
+Build locally before updating the runtime ConfigMap:
+
+```bash
+npm run build
+```
+
+Upload the full `dist` directory as a ConfigMap and mount it over `/src/dist`:
+
+```bash
+tar -czf /tmp/cc-proxy-dist.tgz -C . dist
+scp /tmp/cc-proxy-dist.tgz ubuntu@43.128.89.221:/tmp/cc-proxy-dist.tgz
+```
+
+On the Zeabur host:
+
+```bash
+NS=environment-6a2ad5e305a35017ba9066bb
+DEPLOY=service-6a2ad5ee16481d6693b3f1f5
+
+rm -rf /tmp/cc-proxy-dist-upload
+mkdir -p /tmp/cc-proxy-dist-upload
+tar -xzf /tmp/cc-proxy-dist.tgz -C /tmp/cc-proxy-dist-upload
+find /tmp/cc-proxy-dist-upload/dist -name '._*' -delete
+
+sudo kubectl create configmap cc-proxy-dist -n "$NS" \
+  --from-file=/tmp/cc-proxy-dist-upload/dist \
+  -o yaml --dry-run=client | sudo kubectl apply -f -
+
+sudo kubectl patch deploy -n "$NS" "$DEPLOY" --type=json -p '[
+  {"op":"replace","path":"/spec/template/spec/containers/0/volumeMounts/1","value":{"name":"cc-proxy-dist","mountPath":"/src/dist","readOnly":true}},
+  {"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"cc-proxy-dist","configMap":{"name":"cc-proxy-dist"}}}
+]'
+
+sudo kubectl rollout restart -n "$NS" deploy/"$DEPLOY"
+sudo kubectl rollout status -n "$NS" deploy/"$DEPLOY" --timeout=150s
+```
+
+After rollout, verify the key runtime hashes:
+
+```bash
+POD=$(sudo kubectl get pods -n "$NS" \
+  -l zeabur_service_id=6a2ad5ee16481d6693b3f1f5 \
+  -o jsonpath='{.items[0].metadata.name}')
+
+sudo kubectl exec -n "$NS" "$POD" -- sh -lc \
+  'sha256sum /src/dist/server.js /src/dist/runner.js /src/dist/session-manager.js /src/dist/types.js'
+```
+
 ## Verification
+
+Latest verified production run: 2026-06-12.
+
+Production status:
+
+```text
+GET /health -> 200, max_sessions=10
+POST /v1/messages text Read hook -> 200, marker ALPHA-BRAVO-CHARLIE-7742 present
+POST /v1/messages stream:true -> 200, Anthropic SSE events present, STREAM_COMPAT_OK present
+POST /v1/messages image 64x64 PNG -> 200, Red
+POST /v1/messages long game-development prompt -> 200, marker ALPHA-BRAVO-CHARLIE-7742 present
+POST /v1/messages persistent second turn -> 200, marker DELTA-ECHO-FOXTROT-3355 present
+Persistent second turn cache_read_input_tokens -> 48460
+```
 
 Local non-paid test suite:
 

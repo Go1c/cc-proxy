@@ -1,85 +1,127 @@
-# Zeabur 部署 TODO（V1 仅功能验证）
+# Zeabur 部署状态与 TODO
 
-目标链路：**部署服务到 Zeabur → 容器内装 claude CLI → 认证 → 启动服务 → 等待用户连接**
+目标链路：
 
-安全/商业暂不考虑，V1 只验证功能能在 Zeabur 上跑通。
-
----
-
-## 已确定的关键决策
-
-### 认证方案：`claude setup-token`（OAuth 长期 token）
-
-OAuth 登录是浏览器流程，无头容器里没有浏览器，**不能在容器内登录**。正确做法：
-
-```
-本地已登录的机器
-  → 运行 `claude setup-token`  （需要 Claude 订阅）
-  → 生成长期 OAuth token
-  → 贴到 Zeabur 环境变量 CLAUDE_CODE_OAUTH_TOKEN
-  → 容器内 claude 读此 token 认证（无需浏览器）
+```text
+Client / Claude SDK
+  -> https://cc-proxy.zeabur.app/v1/messages
+  -> cc-proxy
+  -> real Claude Code CLI
+  -> CLAUDE_CODE_OAUTH_TOKEN subscription quota
 ```
 
-- 用订阅额度，不走 API key 按量计费
-- token 长期有效，适合 headless 部署
+当前目标不是走 Anthropic API credits。生产环境不要配置 `CC_ANTHROPIC_*` 上游变量。
 
-### Zeabur 套餐：2GB 内存 → MAX_SESSIONS=2
+## 当前线上状态
 
-单个常驻 claude 进程实测 committed ≈ 586MB。2GB 扣掉 OS+编排器后约可跑 2 个会话。
-环境变量设 `CC_MAX_SESSIONS=2`。
+- Public URL: `https://cc-proxy.zeabur.app`
+- Kubernetes namespace: `environment-6a2ad5e305a35017ba9066bb`
+- Deployment: `service-6a2ad5ee16481d6693b3f1f5`
+- Runtime mount: `cc-proxy-dist` ConfigMap mounted at `/src/dist`
+- Model override: `CC_CLAUDE_MODEL=claude-sonnet-4-6`
+- Permission mode: `CC_PERMISSION_MODE=acceptEdits`
+- Max sessions: `CC_MAX_SESSIONS=10`
+- Auth:
+  - `CLAUDE_CODE_OAUTH_TOKEN` is set for Claude Code CLI.
+  - `CC_PROXY_API_KEY` is set for client access.
+- Removed upstream API env:
+  - `CC_ANTHROPIC_BETA`
+  - `CC_ANTHROPIC_BASE_URL`
+  - `CC_ANTHROPIC_API_KEY`
+  - `CC_ANTHROPIC_AUTH_HEADER`
+  - `CC_ANTHROPIC_VERSION`
 
----
+## 已完成
 
-## TODO 清单
+- 容器内 Claude Code CLI 认证已验证，`apiKeySource` reports `none`, using OAuth token path.
+- Zeabur `$PORT` runtime已验证，服务监听 `8080` 并通过 public route 暴露。
+- `/health` 已验证，返回 `max_sessions=10`。
+- `/v1/messages` 已验证：
+  - Bearer auth works.
+  - Text request works.
+  - `Read demo.txt` hits PreToolUse hook and returns downstream marker `ALPHA-BRAVO-CHARLIE-7742`.
+  - `stream:true` returns Anthropic-style SSE events.
+  - 64x64 PNG image block works and returns `Red`.
+  - Long game-development prompt works.
+  - Persistent session second turn works and reads `sub/nested.txt` marker `DELTA-ECHO-FOXTROT-3355`.
+  - Cache metadata is surfaced; second long turn observed `cache_read_input_tokens=48460`.
+- Claude Code assistant content blocks are preserved, including `thinking` and `signature`.
+- `CC_CLAUDE_MODEL=claude-sonnet-4-6` is passed to the Claude Code CLI.
+- `CC_PERMISSION_MODE=acceptEdits` is passed to the Claude Code CLI.
+- Deployment mismatch fixed:
+  - Bad state: only `/src/dist/server.js` was mounted from ConfigMap, leaving old `runner.js` in the image.
+  - Symptom: `/v1/messages` returned 502 and Claude Code emitted `G?.startsWith is not a function`.
+  - Fix: mount full compiled `dist` directory through `cc-proxy-dist`.
 
-### 1. 验证容器内 claude 认证（头号 go/no-go，未验证）
+## 部署注意
 
-- [ ] 本地机器运行 `claude setup-token`，拿到长期 token
-- [ ] 验证容器内（Linux）`claude -p` 能用 `CLAUDE_CODE_OAUTH_TOKEN` 认证启动
-- [ ] 确认 `-p` 模式在容器里跳过 workspace trust / onboarding 弹窗
+Do not mount only `server.js`. The compiled runtime modules must be deployed as one unit:
 
-> 风险：本机是 Windows 且已 OAuth 登录，无法完全代验 Linux 容器行为。这条不过，整个方案在 Zeabur 上为 0。
+```text
+/src/dist/server.js
+/src/dist/runner.js
+/src/dist/session-manager.js
+/src/dist/types.js
+```
 
-### 2. Dockerfile（未做）
+Recommended flow:
 
-- [ ] 基础镜像 node（claude CLI 需要 Node 运行时）
-- [ ] 全局安装 `@anthropic-ai/claude-code`
-- [ ] 复制 src，`npm install` + `npm run build`（或多阶段构建）
-- [ ] 启动命令 `node dist/server.js`
+```bash
+npm run build
+tar -czf /tmp/cc-proxy-dist.tgz -C . dist
+scp /tmp/cc-proxy-dist.tgz ubuntu@43.128.89.221:/tmp/cc-proxy-dist.tgz
+```
 
-### 3. 服务监听 Zeabur 的 $PORT（需改）
+On the Zeabur host:
 
-- [ ] 当前端口写死读 `CC_PROXY_PORT`（默认 3456）。Zeabur 注入 `PORT`，需让 server 读取 `process.env.PORT`
+```bash
+NS=environment-6a2ad5e305a35017ba9066bb
+DEPLOY=service-6a2ad5ee16481d6693b3f1f5
 
-### 4. 容器内 hook 配置（需确认）
+rm -rf /tmp/cc-proxy-dist-upload
+mkdir -p /tmp/cc-proxy-dist-upload
+tar -xzf /tmp/cc-proxy-dist.tgz -C /tmp/cc-proxy-dist-upload
+find /tmp/cc-proxy-dist-upload/dist -name '._*' -delete
 
-- [ ] `test-workspace/.claude/settings.local.json` 里 hook URL 写的是 `localhost:3456`，容器内端口若变需同步
-- [ ] 验证 stream-json + HTTP hook 在 Linux 容器里行为与本机一致（未验证）
+sudo kubectl create configmap cc-proxy-dist -n "$NS" \
+  --from-file=/tmp/cc-proxy-dist-upload/dist \
+  -o yaml --dry-run=client | sudo kubectl apply -f -
 
-### 5. 下游文件放哪（V1 决策待定）
+sudo kubectl rollout restart -n "$NS" deploy/"$DEPLOY"
+sudo kubectl rollout status -n "$NS" deploy/"$DEPLOY" --timeout=150s
+```
 
-> 真正的"远程用户本地 agent"还没做。当前 `readFromDownstream` 只读服务器同机的 `downstream-project/` 文件夹。
-- [ ] V1 方案：把 `downstream-project/` 假文件一起打进镜像，先验证 hook+session+缓存链路在 Zeabur 上跑通
-- [ ] 注意：部署后用户真实文件在用户电脑上，服务器读不到——这是 V2 的真功能
+After rollout:
 
----
+```bash
+POD=$(sudo kubectl get pods -n "$NS" \
+  -l zeabur_service_id=6a2ad5ee16481d6693b3f1f5 \
+  -o jsonpath='{.items[0].metadata.name}')
 
-## 暂不做（V1 明确排除）
+sudo kubectl exec -n "$NS" "$POD" -- sh -lc \
+  'sha256sum /src/dist/server.js /src/dist/runner.js /src/dist/session-manager.js /src/dist/types.js'
+```
 
-- API key / Bearer 鉴权（公网裸奔，仅功能验证阶段可接受）
-- `--max-budget-usd` 预算上限
-- 真实远程下游 agent（session→agent 绑定、网络协议）
-- Read 之外的工具（LS / Glob / Grep / Edit / Write / Bash）
-- PostToolUse 输出替换
-- web 前端 / 多租户 key 映射
+## TODO
 
----
+- Run full external cctest again against `https://cc-proxy.zeabur.app`.
+- Implement live token streaming instead of buffered SSE.
+- Implement real client-supplied Anthropic tool-use protocol:
+  - `tools`
+  - `tool_choice`
+  - emitted `tool_use`
+  - follow-up `tool_result`
+- Map Anthropic `thinking` request options to Claude Code if a stable CLI/API switch exists.
+- Decide whether request `model` should override `CC_CLAUDE_MODEL` per request.
+- Improve Anthropic-compatible headers, request IDs, and error shapes.
+- Add per-client keys or a key store instead of one shared `CC_PROXY_API_KEY`.
+- Add explicit rate limiting beyond `CC_MAX_SESSIONS`.
+- Design the real downstream workspace sync path for writes/edits.
+- Script the Zeabur ConfigMap deployment to avoid manual patch drift.
+- Add cctest-focused automated fixtures for long context, images, stream mode, assistant history, cache reuse, and tool protocol edge cases.
 
-## 已完成（本机验证通过）
+## 已知边界
 
-- ClaudeRunner：单个常驻 claude stream-json 进程，多轮复用
-- SessionManager：会话生命周期、MAX_SESSIONS 上限、空闲回收、优雅关停
-- HTTP 会话 API + Read hook 转发
-- 53 单元测试 + 23 集成测试全通过
-- 实测：缓存跨轮命中（成本约降 6x）、会话进程隔离、SIGTERM 无僵尸进程
-- 实测单进程内存 ~586MB committed
+- Very small images can be rejected by the underlying Claude Code/API image processor. A normal 64x64 PNG passed through `/v1/messages`.
+- Token usage is high because Claude Code injects its own runtime/tool/system context. This is expected for the Claude Code subscription path.
+- `usage.total_cost_usd` is reported by Claude Code for observability, but billing/auth is through `CLAUDE_CODE_OAUTH_TOKEN` in this deployment.
