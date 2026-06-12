@@ -63,13 +63,31 @@ export interface TurnUsage {
   total_cost_usd: number;
 }
 
+export type ClaudeContentBlock = {
+  type: string;
+  [key: string]: unknown;
+};
+
+export interface ClaudeStreamMessage {
+  type: "user" | "assistant";
+  message: {
+    role: "user" | "assistant";
+    content: ClaudeContentBlock[];
+  };
+  parent_tool_use_id?: string | null;
+}
+
+export type ClaudeTurnInput = string | ClaudeStreamMessage[];
+
 export interface TurnResult {
   result: string;
+  content: ClaudeContentBlock[];
   session_id: string;
   usage: TurnUsage;
   duration_ms: number;
   num_turns: number;
   is_error: boolean;
+  stop_reason?: string | null;
 }
 
 export type SessionState =

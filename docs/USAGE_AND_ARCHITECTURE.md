@@ -22,6 +22,7 @@ Runtime environment variables:
 CLAUDE_CODE_OAUTH_TOKEN=<Claude Code OAuth token>
 CC_PROXY_API_KEY=<shared proxy API key>
 CLAUDE_COMMAND=/src/node_modules/@anthropic-ai/claude-code-linux-x64/claude
+CC_CLAUDE_MODEL=claude-sonnet-4-6
 CC_PERMISSION_MODE=acceptEdits
 ```
 
@@ -84,7 +85,7 @@ Streaming clients:
 stream: true
 ```
 
-The proxy supports Anthropic-style Server-Sent Events for clients that require streaming. The underlying Claude Code turn is still executed as a real Claude Code request; the proxy currently sends the resulting assistant text as a buffered SSE response rather than token-by-token live streaming.
+The proxy supports Anthropic-style Server-Sent Events for clients that require streaming. The underlying Claude Code turn is still executed as a real Claude Code request; the proxy currently sends buffered SSE events after the Claude Code turn completes rather than token-by-token live streaming.
 
 ### Persistent cache sessions
 
@@ -147,8 +148,9 @@ Node HTTP server (dist/server.js)
   |
   +-- Anthropic compatibility adapter
   |     - validates /v1/messages JSON
-  |     - converts messages into a Claude Code prompt
-  |     - maps Claude Code result into Anthropic message JSON
+  |     - converts user/assistant messages into Claude Code stream-json events
+  |     - preserves native content blocks where Claude Code supports them
+  |     - maps Claude Code assistant/result events into Anthropic message JSON
   |
   +-- SessionManager
         - creates and tracks Claude Code sessions
@@ -159,8 +161,8 @@ Node HTTP server (dist/server.js)
         v
       ClaudeRunner
         - starts bundled @anthropic-ai/claude-code native binary
-        - sends stream-json user turns
-        - parses result, usage, cache and cost metadata
+        - sends stream-json user/assistant turns
+        - parses assistant content blocks, result, usage, cache and cost metadata
         |
         v
       Claude Code CLI in /src/test-workspace
@@ -198,8 +200,10 @@ Node HTTP server (dist/server.js)
 - Optional Claude Code permission mode via `CC_PERMISSION_MODE`, including `acceptEdits` for write/edit validation.
 - Anthropic-style `POST /v1/messages`:
   - accepts `x-api-key` and `Authorization: Bearer`,
-  - returns `type: "message"`, assistant text content, stop reason and usage,
+  - returns `type: "message"`, assistant content blocks, stop reason and usage,
   - supports `stream: true` using Anthropic-style buffered SSE events,
+  - passes supported content blocks to Claude Code as native stream-json blocks, including text, image, document, tool_result, and assistant history blocks,
+  - preserves Claude Code assistant blocks such as `thinking` with `signature` when Claude Code emits them,
   - returns cache and cost metadata from Claude Code in `usage`,
   - supports temporary one-shot sessions and optional persistent sessions.
 - Optional model override via `CC_CLAUDE_MODEL`.
@@ -208,8 +212,8 @@ Node HTTP server (dist/server.js)
 ## Not Implemented Yet
 
 - Token-by-token live streaming is not implemented. `stream: true` clients receive Anthropic-style SSE events after the Claude Code turn completes.
-- Full Anthropic tool-use protocol is not implemented. Client-supplied `tools` are included as prompt context, but the proxy does not return `tool_use` blocks or execute client function tools.
-- Multimodal content is not natively handled. Non-text content blocks are serialized into prompt text.
+- Full client-supplied Anthropic tool-use protocol is not implemented. Client-supplied `tools` are included as prompt context, but the proxy does not dynamically register or execute those client function tools.
+- `thinking` request options are not translated into a per-request Claude Code effort setting yet. The proxy preserves `thinking` blocks and signatures when Claude Code emits them.
 - `/v1/messages` does not currently pass the request `model` field through to Claude Code. The response echoes the requested model for SDK compatibility; the actual Claude Code model is selected by Claude Code or `CC_CLAUDE_MODEL`.
 - Official Anthropic response headers and every edge-case error shape are not fully reproduced.
 - There is no rate limiting beyond `CC_MAX_SESSIONS`.

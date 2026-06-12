@@ -214,6 +214,58 @@ process.stdin.on("data", (chunk) => {
   return scriptPath;
 }
 
+function writeInspectingClaudeCommand(): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `inspect-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let idx;
+  while ((idx = buffer.indexOf("\\n")) >= 0) {
+    const line = buffer.slice(0, idx).trim();
+    buffer = buffer.slice(idx + 1);
+    if (!line) continue;
+    const input = JSON.parse(line);
+    const content = Array.isArray(input.message?.content) ? input.message.content : [];
+    const contentTypes = content.map((block) => block?.type || "unknown").join(",");
+    process.stdout.write(JSON.stringify({
+      type: "assistant",
+      session_id: "fake-cli-session",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "Saw native stream-json content.", signature: "sig_native_probe" },
+          { type: "text", text: "CONTENT_TYPES:" + contentTypes }
+        ]
+      }
+    }) + "\\n");
+    process.stdout.write(JSON.stringify({
+      type: "result",
+      session_id: "fake-cli-session",
+      result: "CONTENT_TYPES:" + contentTypes,
+      usage: {
+        input_tokens: 3,
+        output_tokens: 4,
+        cache_creation_input_tokens: 5,
+        cache_read_input_tokens: 6
+      },
+      total_cost_usd: 0.0123,
+      duration_ms: 10,
+      num_turns: 1,
+      is_error: false
+    }) + "\\n");
+  }
+});
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
 async function startTestServer(
   port: number,
   env: NodeJS.ProcessEnv
@@ -454,6 +506,53 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.match(res.body, /event: message_stop/);
         assert.match(res.body, /FAKE_STREAM_RESULT/);
         assert.match(res.body, /"total_cost_usd":0.0123/);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("passes multimodal content to Claude Code as native stream-json blocks and preserves assistant blocks", async () => {
+      const fakeClaude = writeInspectingClaudeCommand();
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            messages: [
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "image",
+                    source: {
+                      type: "base64",
+                      media_type: "image/png",
+                      data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB",
+                    },
+                  },
+                  {
+                    type: "text",
+                    text: "Identify the debug overlay color for a tactics game.",
+                  },
+                ],
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        const body = JSON.parse(res.body);
+        assert.equal(res.status, 200);
+        assert.equal(body.content[0].type, "thinking");
+        assert.equal(body.content[0].signature, "sig_native_probe");
+        assert.equal(body.content[1].type, "text");
+        assert.equal(body.content[1].text, "CONTENT_TYPES:image,text");
       } finally {
         proc.kill("SIGKILL");
         await sleep(300);

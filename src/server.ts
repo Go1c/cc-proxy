@@ -4,7 +4,12 @@ import path from "path";
 import os from "os";
 import { randomUUID } from "crypto";
 import { URL } from "url";
-import { HookPayload, PreToolUseOutput } from "./types";
+import {
+  ClaudeContentBlock,
+  ClaudeStreamMessage,
+  HookPayload,
+  PreToolUseOutput,
+} from "./types";
 import { SessionManager, CapacityError, MAX_SESSIONS } from "./session-manager";
 
 const PORT = parseInt(process.env.PORT || process.env.CC_PROXY_PORT || "3456", 10);
@@ -193,8 +198,54 @@ function contentToText(content: any): string {
   return JSON.stringify(content);
 }
 
-function buildPromptFromAnthropicMessages(body: any):
-  | { ok: true; prompt: string; model: string }
+function contentToBlocks(content: any): ClaudeContentBlock[] {
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  if (Array.isArray(content)) {
+    return content.map((block) => {
+      if (block && typeof block === "object" && typeof block.type === "string") {
+        return block as ClaudeContentBlock;
+      }
+      return { type: "text", text: String(block ?? "") };
+    });
+  }
+  if (content == null) return [];
+  return [{ type: "text", text: JSON.stringify(content) }];
+}
+
+function makeClaudeStreamMessage(message: any): ClaudeStreamMessage {
+  return {
+    type: message.role,
+    message: {
+      role: message.role,
+      content: contentToBlocks(message.content),
+    },
+    parent_tool_use_id: null,
+  };
+}
+
+function addContextToFirstUserMessage(
+  messages: ClaudeStreamMessage[],
+  context: string
+): ClaudeStreamMessage[] {
+  if (!context) return messages;
+  const contextBlock: ClaudeContentBlock = { type: "text", text: context };
+  const firstUser = messages.find((message) => message.type === "user");
+  if (firstUser) {
+    firstUser.message.content = [contextBlock, ...firstUser.message.content];
+    return messages;
+  }
+  return [
+    {
+      type: "user",
+      message: { role: "user", content: [contextBlock] },
+      parent_tool_use_id: null,
+    },
+    ...messages,
+  ];
+}
+
+function buildTurnInputFromAnthropicMessages(body: any):
+  | { ok: true; messages: ClaudeStreamMessage[]; model: string }
   | { ok: false; message: string } {
   if (!body || typeof body !== "object") {
     return { ok: false, message: "Request body must be a JSON object" };
@@ -206,10 +257,11 @@ function buildPromptFromAnthropicMessages(body: any):
     return { ok: false, message: "Missing non-empty 'messages' array" };
   }
 
-  const parts: string[] = [];
+  const contextParts: string[] = [];
   if (body.system) {
-    parts.push(`[system]\n${contentToText(body.system)}`);
+    contextParts.push(`[system]\n${contentToText(body.system)}`);
   }
+  const messages: ClaudeStreamMessage[] = [];
   for (const message of body.messages) {
     if (!message || typeof message !== "object") {
       return { ok: false, message: "Each message must be an object" };
@@ -217,17 +269,21 @@ function buildPromptFromAnthropicMessages(body: any):
     if (message.role !== "user" && message.role !== "assistant") {
       return { ok: false, message: "Message role must be 'user' or 'assistant'" };
     }
-    parts.push(`[${message.role}]\n${contentToText(message.content)}`);
+    messages.push(makeClaudeStreamMessage(message));
   }
   if (Array.isArray(body.tools) && body.tools.length > 0) {
-    parts.push(
+    contextParts.push(
       `[client_tools]\n${JSON.stringify(body.tools)}\n` +
         "If a tool result is required, explain the requested tool call in text. " +
         "This proxy executes Claude Code tools in the workspace, not client-supplied function tools."
     );
   }
 
-  return { ok: true, prompt: parts.join("\n\n"), model: body.model };
+  return {
+    ok: true,
+    messages: addContextToFirstUserMessage(messages, contextParts.join("\n\n")),
+    model: body.model,
+  };
 }
 
 function makeAnthropicMessage(model: string, result: any): any {
@@ -236,8 +292,11 @@ function makeAnthropicMessage(model: string, result: any): any {
     type: "message",
     role: "assistant",
     model,
-    content: [{ type: "text", text: result.result }],
-    stop_reason: "end_turn",
+    content:
+      Array.isArray(result.content) && result.content.length > 0
+        ? result.content
+        : [{ type: "text", text: result.result }],
+    stop_reason: result.stop_reason || "end_turn",
     stop_sequence: null,
     usage: {
       input_tokens: result.usage.input_tokens,
@@ -286,23 +345,12 @@ function sendAnthropicStream(
       },
     },
   });
-  sendSseEvent(res, "content_block_start", {
-    type: "content_block_start",
-    index: 0,
-    content_block: { type: "text", text: "" },
-  });
-  sendSseEvent(res, "content_block_delta", {
-    type: "content_block_delta",
-    index: 0,
-    delta: { type: "text_delta", text: message.content[0].text },
-  });
-  sendSseEvent(res, "content_block_stop", {
-    type: "content_block_stop",
-    index: 0,
+  message.content.forEach((block: any, index: number) => {
+    sendSseContentBlock(res, index, block);
   });
   sendSseEvent(res, "message_delta", {
     type: "message_delta",
-    delta: { stop_reason: "end_turn", stop_sequence: null },
+    delta: { stop_reason: message.stop_reason || "end_turn", stop_sequence: null },
     usage: {
       output_tokens: message.usage.output_tokens,
       total_cost_usd: message.usage.total_cost_usd,
@@ -310,6 +358,93 @@ function sendAnthropicStream(
   });
   sendSseEvent(res, "message_stop", { type: "message_stop" });
   res.end();
+}
+
+function sendSseContentBlock(
+  res: http.ServerResponse,
+  index: number,
+  block: any
+): void {
+  if (block?.type === "text") {
+    sendSseEvent(res, "content_block_start", {
+      type: "content_block_start",
+      index,
+      content_block: { type: "text", text: "" },
+    });
+    sendSseEvent(res, "content_block_delta", {
+      type: "content_block_delta",
+      index,
+      delta: { type: "text_delta", text: block.text || "" },
+    });
+    sendSseEvent(res, "content_block_stop", {
+      type: "content_block_stop",
+      index,
+    });
+    return;
+  }
+
+  if (block?.type === "thinking") {
+    sendSseEvent(res, "content_block_start", {
+      type: "content_block_start",
+      index,
+      content_block: { type: "thinking", thinking: "" },
+    });
+    if (block.thinking) {
+      sendSseEvent(res, "content_block_delta", {
+        type: "content_block_delta",
+        index,
+        delta: { type: "thinking_delta", thinking: block.thinking },
+      });
+    }
+    if (block.signature) {
+      sendSseEvent(res, "content_block_delta", {
+        type: "content_block_delta",
+        index,
+        delta: { type: "signature_delta", signature: block.signature },
+      });
+    }
+    sendSseEvent(res, "content_block_stop", {
+      type: "content_block_stop",
+      index,
+    });
+    return;
+  }
+
+  if (block?.type === "tool_use") {
+    sendSseEvent(res, "content_block_start", {
+      type: "content_block_start",
+      index,
+      content_block: {
+        type: "tool_use",
+        id: block.id,
+        name: block.name,
+        input: {},
+      },
+    });
+    sendSseEvent(res, "content_block_delta", {
+      type: "content_block_delta",
+      index,
+      delta: {
+        type: "input_json_delta",
+        partial_json: JSON.stringify(block.input ?? {}),
+      },
+    });
+    sendSseEvent(res, "content_block_stop", {
+      type: "content_block_stop",
+      index,
+    });
+    return;
+  }
+
+  sendSseEvent(res, "content_block_start", {
+    type: "content_block_start",
+    index,
+    content_block: block || { type: "text", text: "" },
+  });
+  sendSseEvent(res, "content_block_stop", {
+    type: "content_block_stop",
+    index,
+  });
 }
 
 async function handleAnthropicMessages(
@@ -327,9 +462,9 @@ async function handleAnthropicMessages(
     return;
   }
 
-  const promptResult = buildPromptFromAnthropicMessages(body);
-  if (!promptResult.ok) {
-    sendAnthropicError(res, 400, "invalid_request_error", promptResult.message);
+  const turnInputResult = buildTurnInputFromAnthropicMessages(body);
+  if (!turnInputResult.ok) {
+    sendAnthropicError(res, 400, "invalid_request_error", turnInputResult.message);
     return;
   }
 
@@ -355,7 +490,7 @@ async function handleAnthropicMessages(
       closeAfterTurn = !keepSession;
     }
 
-    const result = await sessions.turn(sessionId, promptResult.prompt);
+    const result = await sessions.turn(sessionId, turnInputResult.messages);
     if (result.is_error) {
       sendAnthropicError(res, 502, "api_error", result.result || "Claude Code turn failed");
       return;
@@ -366,7 +501,7 @@ async function handleAnthropicMessages(
     };
     if (!closeAfterTurn) responseHeaders["x-cc-session-id"] = sessionId;
 
-    const message = makeAnthropicMessage(promptResult.model, result);
+    const message = makeAnthropicMessage(turnInputResult.model, result);
     if (body.stream === true) {
       sendAnthropicStream(res, message, responseHeaders);
     } else {

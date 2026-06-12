@@ -1,6 +1,6 @@
 import { randomUUID } from "crypto";
 import { ClaudeRunner } from "./runner";
-import { SessionInfo, SessionState, TurnResult } from "./types";
+import { ClaudeTurnInput, SessionInfo, SessionState, TurnResult } from "./types";
 
 const MAX_SESSIONS = parseInt(process.env.CC_MAX_SESSIONS || "10", 10);
 const IDLE_TIMEOUT_MS = parseInt(
@@ -69,7 +69,7 @@ export class SessionManager {
     return this.toInfo(session);
   }
 
-  async turn(id: string, prompt: string): Promise<TurnResult> {
+  async turn(id: string, input: ClaudeTurnInput): Promise<TurnResult> {
     const session = this.sessions.get(id);
     if (!session) throw new Error("session not found");
     if (!session.runner.isAlive) throw new Error("session not alive");
@@ -79,7 +79,7 @@ export class SessionManager {
     session.state = "running";
     session.lastActiveAt = Date.now();
     try {
-      const result = await session.runner.send(prompt);
+      const result = await session.runner.send(input);
       session.turns++;
       return result;
     } finally {

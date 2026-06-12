@@ -2,7 +2,13 @@ import { spawn, ChildProcessWithoutNullStreams } from "child_process";
 import { EventEmitter } from "events";
 import fs from "fs";
 import path from "path";
-import { TurnResult, TurnUsage } from "./types";
+import {
+  ClaudeContentBlock,
+  ClaudeStreamMessage,
+  ClaudeTurnInput,
+  TurnResult,
+  TurnUsage,
+} from "./types";
 
 const DEFAULT_TURN_TIMEOUT_MS = parseInt(
   process.env.CC_TURN_TIMEOUT_MS || "120000",
@@ -13,6 +19,8 @@ interface PendingTurn {
   resolve: (r: TurnResult) => void;
   reject: (e: Error) => void;
   timer: NodeJS.Timeout;
+  thinkingBlocks: ClaudeContentBlock[];
+  lastAssistantContent: ClaudeContentBlock[];
 }
 
 export function resolveClaudeCommand(): string {
@@ -109,26 +117,34 @@ export class ClaudeRunner extends EventEmitter {
     return !!this.proc && !this.closed;
   }
 
-  /** Send one user turn; resolves with the result for that turn. */
-  send(text: string, timeoutMs = DEFAULT_TURN_TIMEOUT_MS): Promise<TurnResult> {
+  /** Send one turn; resolves with the result for that turn. */
+  send(input: ClaudeTurnInput, timeoutMs = DEFAULT_TURN_TIMEOUT_MS): Promise<TurnResult> {
     if (!this.proc || this.closed) {
       return Promise.reject(new Error("runner not running"));
     }
     if (this.pending) {
       return Promise.reject(new Error("a turn is already in flight"));
     }
+    const messages = normalizeTurnInput(input);
+    if (messages.length === 0) {
+      return Promise.reject(new Error("turn input must contain at least one message"));
+    }
     return new Promise<TurnResult>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending = null;
         reject(new Error(`turn timed out after ${timeoutMs}ms`));
       }, timeoutMs);
-      this.pending = { resolve, reject, timer };
-
-      const msg = {
-        type: "user",
-        message: { role: "user", content: [{ type: "text", text }] },
+      this.pending = {
+        resolve,
+        reject,
+        timer,
+        thinkingBlocks: [],
+        lastAssistantContent: [],
       };
-      this.proc!.stdin.write(JSON.stringify(msg) + "\n");
+
+      for (const msg of messages) {
+        this.proc!.stdin.write(JSON.stringify(msg) + "\n");
+      }
     });
   }
 
@@ -171,14 +187,29 @@ export class ClaudeRunner extends EventEmitter {
     if (obj.session_id && !this.cliSessionId) {
       this.cliSessionId = obj.session_id;
     }
+    if (obj.type === "assistant") {
+      this.onAssistant(obj);
+    }
     if (obj.type === "result") {
       this.onResult(obj);
     }
   }
 
+  private onAssistant(obj: any): void {
+    if (!this.pending) return;
+    const content = normalizeContentBlocks(obj.message?.content);
+    if (content.length === 0) return;
+    this.pending.lastAssistantContent = content;
+    for (const block of content) {
+      if (block.type === "thinking") {
+        this.pending.thinkingBlocks.push(block);
+      }
+    }
+  }
+
   private onResult(obj: any): void {
     if (!this.pending) return;
-    const { resolve, timer } = this.pending;
+    const { resolve, timer, thinkingBlocks, lastAssistantContent } = this.pending;
     clearTimeout(timer);
     this.pending = null;
 
@@ -190,13 +221,20 @@ export class ClaudeRunner extends EventEmitter {
       cache_read_input_tokens: u.cache_read_input_tokens || 0,
       total_cost_usd: obj.total_cost_usd || 0,
     };
+    const resultText = typeof obj.result === "string" ? obj.result : "";
+    const finalContent =
+      lastAssistantContent.length > 0
+        ? mergeThinkingBlocks(thinkingBlocks, lastAssistantContent)
+        : [{ type: "text", text: resultText }];
     resolve({
-      result: typeof obj.result === "string" ? obj.result : "",
+      result: resultText,
+      content: finalContent,
       session_id: obj.session_id || this.cliSessionId || "",
       usage,
       duration_ms: obj.duration_ms || 0,
       num_turns: obj.num_turns || 0,
       is_error: !!obj.is_error,
+      stop_reason: obj.stop_reason || null,
     });
   }
 
@@ -220,4 +258,46 @@ export class ClaudeRunner extends EventEmitter {
     }
     this.emit("error", err);
   }
+}
+
+function normalizeTurnInput(input: ClaudeTurnInput): ClaudeStreamMessage[] {
+  if (typeof input === "string") {
+    return [
+      {
+        type: "user",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: input }],
+        },
+        parent_tool_use_id: null,
+      },
+    ];
+  }
+  return input.map((message) => ({
+    type: message.type,
+    message: {
+      role: message.message.role,
+      content: normalizeContentBlocks(message.message.content),
+    },
+    parent_tool_use_id: message.parent_tool_use_id ?? null,
+  }));
+}
+
+function normalizeContentBlocks(content: unknown): ClaudeContentBlock[] {
+  if (!Array.isArray(content)) return [];
+  return content
+    .filter((block): block is ClaudeContentBlock => {
+      return !!block && typeof block === "object" && typeof (block as any).type === "string";
+    })
+    .map((block) => ({ ...block }));
+}
+
+function mergeThinkingBlocks(
+  thinkingBlocks: ClaudeContentBlock[],
+  finalContent: ClaudeContentBlock[]
+): ClaudeContentBlock[] {
+  if (finalContent.some((block) => block.type === "thinking")) {
+    return finalContent;
+  }
+  return [...thinkingBlocks, ...finalContent];
 }
