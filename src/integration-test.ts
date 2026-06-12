@@ -190,7 +190,7 @@ async function testAnthropicMessagesApi() {
     }
 
     const unauth = await req("POST", "/v1/messages", {
-      model: "claude-sonnet-4-6",
+      model: "claude-sonnet-4-5",
       max_tokens: 128,
       messages: [{ role: "user", content: "hello" }],
     });
@@ -200,7 +200,7 @@ async function testAnthropicMessagesApi() {
       "POST",
       "/v1/messages",
       {
-        model: "claude-sonnet-4-6",
+        model: "claude-sonnet-4-5",
         max_tokens: 128,
         messages: [
           {
@@ -230,7 +230,7 @@ async function testAnthropicMessagesApi() {
       "POST",
       "/v1/messages",
       {
-        model: "claude-sonnet-4-6",
+        model: "claude-sonnet-4-5",
         max_tokens: 256,
         messages: [
           {

@@ -81,7 +81,7 @@ curl -sS https://cc-proxy.zeabur.app/v1/messages \
   -H 'content-type: application/json' \
   -H 'x-api-key: <your proxy key>' \
   -d '{
-    "model": "claude-sonnet-4-6",
+    "model": "claude-sonnet-4-5",
     "max_tokens": 512,
     "messages": [
       {
@@ -289,7 +289,7 @@ curl -sS https://cc-proxy.zeabur.app/v1/messages \
   -H 'content-type: application/json' \
   -H 'Authorization: Bearer <your proxy key>' \
   -d '{
-    "model": "claude-sonnet-4-6",
+    "model": "claude-sonnet-4-5",
     "max_tokens": 512,
     "messages": [
       {
@@ -313,7 +313,7 @@ curl -sS https://cc-proxy.zeabur.app/v1/messages \
   -H 'content-type: application/json' \
   -H 'Authorization: Bearer <your proxy key>' \
   -d '{
-    "model": "claude-sonnet-4-6",
+    "model": "claude-sonnet-4-5",
     "max_tokens": 1600,
     "messages": [
       {
