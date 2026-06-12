@@ -28,6 +28,9 @@ export interface ClaudeRunnerOptions {
   model?: string;
   permissionMode?: string;
   effort?: string;
+  mcpConfig?: string;
+  strictMcpConfig?: boolean;
+  allowedTools?: string[];
 }
 
 export interface TurnCallbacks {
@@ -92,6 +95,15 @@ export function resolveClaudeArgs(options: ClaudeRunnerOptions = {}): string[] {
   const effort = options.effort || process.env.CC_CLAUDE_EFFORT;
   if (effort) {
     args.push("--effort", effort);
+  }
+  if (options.mcpConfig) {
+    args.push("--mcp-config", options.mcpConfig);
+  }
+  if (options.strictMcpConfig) {
+    args.push("--strict-mcp-config");
+  }
+  if (options.allowedTools && options.allowedTools.length > 0) {
+    args.push("--allowedTools", options.allowedTools.join(","));
   }
   return args;
 }

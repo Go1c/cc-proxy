@@ -206,7 +206,99 @@ Client-supplied Anthropic function tools:
 }
 ```
 
-These are intentionally rejected with `501 not_supported_error`. This avoids fake prompt-emulated tool support. Claude Code's own workspace tools still run normally inside the CLI session, but the Anthropic client-tool protocol needs a real multi-turn `tool_use` / `tool_result` bridge before it can be marked compatible.
+These are supported through a real per-request MCP bridge, not prompt emulation. For a new `/v1/messages` request with `tools`, the proxy starts Claude Code with:
+
+```text
+--mcp-config <dynamic config>
+--strict-mcp-config
+--allowedTools mcp__cc_client_tools__<tool name>
+```
+
+The dynamic MCP server exposes the client-provided tool specs to Claude Code. When Claude Code calls the MCP tool, the first `/v1/messages` response returns Anthropic-style `tool_use` with `stop_reason: "tool_use"`. The client must then send the conversation back with the assistant `tool_use` block and a user `tool_result` block with the same `tool_use_id`.
+
+First request:
+
+```json
+{
+  "model": "claude-sonnet-4-6",
+  "max_tokens": 512,
+  "tools": [
+    {
+      "name": "lookup_frame_budget",
+      "description": "Look up frame-budget guidance for a game platform.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "platform": { "type": "string" }
+        },
+        "required": ["platform"]
+      }
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": "Use lookup_frame_budget for a Nintendo Switch action RPG frame-budget check."
+    }
+  ]
+}
+```
+
+Expected first response shape:
+
+```json
+{
+  "type": "message",
+  "role": "assistant",
+  "stop_reason": "tool_use",
+  "content": [
+    {
+      "type": "tool_use",
+      "id": "toolu_...",
+      "name": "lookup_frame_budget",
+      "input": { "platform": "switch" }
+    }
+  ]
+}
+```
+
+Follow-up request:
+
+```json
+{
+  "model": "claude-sonnet-4-6",
+  "max_tokens": 512,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Use lookup_frame_budget for a Nintendo Switch action RPG frame-budget check."
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_...",
+          "name": "lookup_frame_budget",
+          "input": { "platform": "switch" }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_...",
+          "content": "Switch handheld budget: keep simulation plus render under 16.67ms."
+        }
+      ]
+    }
+  ]
+}
+```
+
+`stream: true` is supported for both the initial `tool_use` turn and the resumed `tool_result` answer. Client-supplied tools currently require a new one-shot Claude Code session because MCP configuration is attached when the process starts. Passing `tools` with an existing `x-cc-session-id` returns `400 invalid_request_error`; passing `x-cc-keep-session: true` with `tools` is ignored and no `x-cc-session-id` is returned.
 
 Thinking requests:
 
@@ -293,6 +385,16 @@ Node HTTP server (dist/server.js)
   |     - preserves native content blocks where Claude Code supports them
   |     - forwards Claude Code partial stream_event objects as Anthropic SSE
   |     - maps Claude Code assistant/result events into Anthropic message JSON
+  |     - maps client-supplied tools to a per-request MCP bridge
+  |
+  +-- ClientToolBridge
+  |     - exposes client tool specs through /internal/tool-bridge/{id}/tools
+  |     - waits for client tool_result through /internal/tool-bridge/{id}/call
+  |     - emits Anthropic tool_use and resumes the original Claude Code turn
+  |
+  +-- client-tool-mcp-server.js
+  |     - stdio JSON-RPC MCP server launched by Claude Code
+  |     - implements initialize, tools/list, and tools/call
   |
   +-- SessionManager
         - creates and tracks Claude Code sessions
@@ -308,6 +410,8 @@ Node HTTP server (dist/server.js)
         |
         v
       Claude Code CLI in /src/test-workspace
+        |
+        +-- Dynamic MCP client-tool server when request tools are supplied
         |
         +-- .claude/settings.json PreToolUse hook
               |
@@ -350,7 +454,8 @@ Node HTTP server (dist/server.js)
   - returns cache and cost metadata from Claude Code in `usage`,
   - maps request `model` to Claude Code `--model` for new sessions,
   - maps request `thinking.budget_tokens` approximately to Claude Code `--effort` for new sessions,
-  - rejects client-supplied Anthropic `tools` with `501 not_supported_error` instead of prompt-emulating them,
+  - supports client-supplied Anthropic `tools` through a real one-shot Claude Code MCP bridge,
+  - emits `tool_use` and accepts follow-up `tool_result` to resume the original Claude Code turn,
   - supports temporary one-shot sessions and optional persistent sessions.
 - Optional model override via `CC_CLAUDE_MODEL`.
 - Optional permission-mode override via `CC_PERMISSION_MODE`.
@@ -367,20 +472,23 @@ Node HTTP server (dist/server.js)
 - Preserved native input blocks passed to Claude Code, including text, image, document, tool_result, and assistant history blocks.
 - Passed `/v1/messages` request `model` through to Claude Code `--model` for new sessions.
 - Mapped `/v1/messages` `thinking.budget_tokens` to Claude Code `--effort` for new sessions.
-- Replaced prompt-emulated client-supplied `tools` with explicit `501 not_supported_error`.
+- Replaced prompt-emulated client-supplied `tools` with a real per-request MCP bridge.
+- Added Anthropic-style `tool_use` / `tool_result` continuation support.
+- Added live SSE forwarding for the first `tool_use` turn and for the resumed `tool_result` answer.
 - Added `CC_CLAUDE_MODEL=claude-sonnet-4-6` CLI model override.
 - Added `CC_PERMISSION_MODE=acceptEdits` CLI permission override.
 - Set production `CC_MAX_SESSIONS=10`.
 - Removed production `CC_ANTHROPIC_*` environment variables.
 - Fixed the Zeabur deployment mismatch where only `server.js` was mounted and the old image `runner.js` was still used.
-- Added local fake-Claude coverage for live stream chunks, multimodal native blocks, assistant history preservation, request model/effort args, cache metadata, request-id headers, and tool edge cases.
+- Added local fake-Claude coverage for live stream chunks, multimodal native blocks, assistant history preservation, request model/effort args, cache metadata, request-id headers, client-supplied MCP tools, and tool edge cases.
 - Verified production text, stream, image, long-context game-development prompts, Read hook markers, persistent sessions, and cache metadata.
 
 ## Not Implemented Yet
 
-- Full client-supplied Anthropic tool-use protocol is not implemented. Client-supplied `tools` are rejected with `501 not_supported_error`; they are not prompt-emulated.
+- Exact Anthropic `tool_choice` semantics are not fully implemented or verified.
+- Client-supplied `tools` cannot be added to an already-running persistent `x-cc-session-id`, and `x-cc-keep-session` is ignored for tool requests; they require a one-shot Claude Code process so the dynamic MCP config can be attached and safely torn down after the follow-up `tool_result`.
 - `thinking.budget_tokens` uses an approximate Claude Code `--effort` mapping, not exact Anthropic thinking-token budget semantics.
-- Existing persistent sessions cannot change model or effort after the Claude Code process starts.
+- Existing persistent sessions cannot change model, effort, or MCP tool configuration after the Claude Code process starts.
 - Official Anthropic response headers and every edge-case error shape are not fully reproduced beyond the implemented `request-id` and `request_id` fields.
 - There is no rate limiting beyond `CC_MAX_SESSIONS`.
 - There is no per-user key management; `CC_PROXY_API_KEY` is a single shared proxy key.
@@ -388,17 +496,14 @@ Node HTTP server (dist/server.js)
 
 ## TODO
 
-- Implement real client-supplied Anthropic tool protocol support:
-  - accept `tools`,
-  - emit `tool_use`,
-  - accept follow-up `tool_result`,
-  - preserve `tool_choice` semantics where possible.
+- Verify exact `tool_choice` behavior against real Claude Code MCP calls and decide which Anthropic modes can be safely mapped.
+- Add broader production integration coverage for multi-tool and tool error cases.
 - Improve Anthropic-compatible response headers and edge-case error shapes beyond request IDs.
 - Add per-user or per-client API keys instead of one shared `CC_PROXY_API_KEY`.
 - Add explicit production rate limiting beyond `CC_MAX_SESSIONS`.
 - Decide how write/edit results should sync back to a real downstream workspace in a remote-agent architecture.
 - Add a repeatable production deployment script for the `cc-proxy-dist` ConfigMap patch.
-- Add live production integration coverage for request-id headers, live streaming timing, model/effort args, and unsupported `tools` 501 behavior.
+- Add live production integration coverage for request-id headers, live streaming timing, model/effort args, and client-supplied MCP tools.
 
 ## Known Edge Cases
 
@@ -453,19 +558,24 @@ POD=$(sudo kubectl get pods -n "$NS" \
   -o jsonpath='{.items[0].metadata.name}')
 
 sudo kubectl exec -n "$NS" "$POD" -- sh -lc \
-  'sha256sum /src/dist/server.js /src/dist/runner.js /src/dist/session-manager.js /src/dist/types.js'
+  'sha256sum /src/dist/server.js /src/dist/runner.js /src/dist/session-manager.js /src/dist/client-tool-bridge.js /src/dist/client-tool-mcp-server.js /src/dist/types.js'
 ```
 
 ## Verification
 
-Latest verified production run: 2026-06-12.
+Current production status as of 2026-06-12:
 
-Production status:
+```text
+GET /health -> 200, max_sessions=10
+POST /v1/messages -> blocked until Claude Code OAuth is refreshed; current Pod token returns Claude CLI 401 Invalid bearer token
+```
+
+Previous verified production run on 2026-06-12 before the token refresh issue:
 
 ```text
 GET /health -> 200, max_sessions=10
 POST /v1/messages invalid messages -> 400, request-id header matches body request_id
-POST /v1/messages client-supplied tools -> 501, not_supported_error
+POST /v1/messages client-supplied tools -> pending current deployment verification
 POST /v1/messages text -> 200, request-id and x-cc-cli-session-id present, DEPLOY_NORMAL_OK present
 POST /v1/messages stream:true game-development prompt -> 200, text/event-stream, request-id and x-cc-cli-session-id present, content_block_delta present, STREAM_LIVE_DEPLOY_OK present
 POST /v1/messages text Read hook -> 200, marker ALPHA-BRAVO-CHARLIE-7742 present
@@ -485,10 +595,12 @@ npm test
 Latest local result:
 
 ```text
-tests 69
-pass 69
+tests 72
+pass 72
 fail 0
 ```
+
+Local coverage includes fake-Claude HTTP tests for request-id headers, live stream chunks, multimodal native blocks, assistant history preservation, cache metadata, client-supplied MCP tools, tool edge cases, and long game-development context passthrough.
 
 Real paid integration test:
 

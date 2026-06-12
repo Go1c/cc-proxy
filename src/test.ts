@@ -409,6 +409,220 @@ process.stdin.on("data", (chunk) => {
   return scriptPath;
 }
 
+function writeMcpToolCallingClaudeCommand(delayBeforeToolUseStopMs = 0): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `mcp-tool-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+const { spawn } = require("child_process");
+process.stdin.setEncoding("utf8");
+
+function emit(obj) {
+  process.stdout.write(JSON.stringify(obj) + "\\n");
+}
+
+function getMcpConfig() {
+  const idx = process.argv.indexOf("--mcp-config");
+  if (idx < 0 || !process.argv[idx + 1]) {
+    throw new Error("missing --mcp-config");
+  }
+  return JSON.parse(process.argv[idx + 1]);
+}
+
+function writeFrame(stream, obj) {
+  const json = JSON.stringify(obj);
+  stream.write("Content-Length: " + Buffer.byteLength(json) + "\\r\\n\\r\\n" + json);
+}
+
+function createRpcClient(proc) {
+  let nextId = 1;
+  let buffer = Buffer.alloc(0);
+  const pending = new Map();
+  proc.stdout.on("data", (chunk) => {
+    buffer = Buffer.concat([buffer, chunk]);
+    while (true) {
+      const sep = buffer.indexOf("\\r\\n\\r\\n");
+      if (sep < 0) return;
+      const header = buffer.slice(0, sep).toString("utf8");
+      const match = header.match(/content-length:\\s*(\\d+)/i);
+      if (!match) throw new Error("missing MCP content-length");
+      const length = Number(match[1]);
+      const start = sep + 4;
+      if (buffer.length < start + length) return;
+      const msg = JSON.parse(buffer.slice(start, start + length).toString("utf8"));
+      buffer = buffer.slice(start + length);
+      if (msg.id && pending.has(msg.id)) {
+        const { resolve, reject } = pending.get(msg.id);
+        pending.delete(msg.id);
+        if (msg.error) reject(new Error(msg.error.message || "mcp error"));
+        else resolve(msg);
+      }
+    }
+  });
+  return {
+    request(method, params) {
+      const id = nextId++;
+      writeFrame(proc.stdin, { jsonrpc: "2.0", id, method, params });
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        setTimeout(() => {
+          if (pending.delete(id)) reject(new Error("MCP request timed out: " + method));
+        }, 4000);
+      });
+    },
+    notify(method, params) {
+      writeFrame(proc.stdin, { jsonrpc: "2.0", method, params });
+    }
+  };
+}
+
+async function runMcpToolCall() {
+  const config = getMcpConfig();
+  const server = config.mcpServers && config.mcpServers.cc_client_tools;
+  if (!server) throw new Error("missing cc_client_tools MCP server");
+  const proc = spawn(server.command, server.args || [], {
+    env: { ...process.env, ...(server.env || {}) },
+    stdio: ["pipe", "pipe", "inherit"],
+  });
+  const rpc = createRpcClient(proc);
+  await rpc.request("initialize", {
+    protocolVersion: "2024-11-05",
+    capabilities: {},
+    clientInfo: { name: "fake-claude", version: "test" },
+  });
+  rpc.notify("notifications/initialized", {});
+  const listed = await rpc.request("tools/list", {});
+  const tools = listed.result && listed.result.tools || [];
+  if (!tools.some((tool) => tool.name === "lookup_frame_budget")) {
+    throw new Error("lookup_frame_budget was not listed by MCP server");
+  }
+
+  const toolInput = { platform: "switch" };
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "message_start",
+      message: {
+        id: "msg_fake_tool_use",
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 10, output_tokens: 0 }
+      }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "content_block_start",
+      index: 0,
+      content_block: {
+        type: "tool_use",
+        id: "toolu_frame_budget_001",
+        name: "lookup_frame_budget",
+        input: {}
+      }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "input_json_delta", partial_json: JSON.stringify(toolInput) }
+    }
+  });
+  if (${delayBeforeToolUseStopMs} > 0) {
+    await new Promise((resolve) => setTimeout(resolve, ${delayBeforeToolUseStopMs}));
+  }
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: { type: "content_block_stop", index: 0 }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "message_delta",
+      delta: { stop_reason: "tool_use", stop_sequence: null },
+      usage: { output_tokens: 12 }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: { type: "message_stop" }
+  });
+
+  const callResult = await rpc.request("tools/call", {
+    name: "lookup_frame_budget",
+    arguments: toolInput,
+  });
+  const text = (callResult.result && callResult.result.content || [])
+    .map((item) => item.text || "")
+    .join("\\n");
+  const finalText = "CLIENT_TOOL_RESULT:" + text;
+  emit({
+    type: "assistant",
+    session_id: "fake-cli-session",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: finalText }]
+    }
+  });
+  emit({
+    type: "result",
+    session_id: "fake-cli-session",
+    result: finalText,
+    usage: {
+      input_tokens: 22,
+      output_tokens: 9,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0
+    },
+    total_cost_usd: 0,
+    duration_ms: 50,
+    num_turns: 1,
+    is_error: false,
+    stop_reason: "end_turn"
+  });
+  proc.kill("SIGKILL");
+}
+
+let started = false;
+process.stdin.on("data", async (chunk) => {
+  if (started || !chunk.trim()) return;
+  started = true;
+  try {
+    await runMcpToolCall();
+  } catch (err) {
+    emit({
+      type: "result",
+      session_id: "fake-cli-session",
+      result: err.message,
+      usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      total_cost_usd: 0,
+      duration_ms: 1,
+      num_turns: 1,
+      is_error: true,
+      stop_reason: "error"
+    });
+  }
+});
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
 function writeInspectingClaudeCommand(): string {
   const scriptPath = path.join(TEST_WORKSPACE, `inspect-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
   fs.writeFileSync(
@@ -448,6 +662,69 @@ process.stdin.on("data", (chunk) => {
         cache_read_input_tokens: 6
       },
       total_cost_usd: 0.0123,
+      duration_ms: 10,
+      num_turns: 1,
+      is_error: false
+    }) + "\\n");
+  }
+});
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
+function writeLongContextInspectingClaudeCommand(): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `long-context-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let idx;
+  while ((idx = buffer.indexOf("\\n")) >= 0) {
+    const line = buffer.slice(0, idx).trim();
+    buffer = buffer.slice(idx + 1);
+    if (!line) continue;
+    const input = JSON.parse(line);
+    const content = Array.isArray(input.message?.content) ? input.message.content : [];
+    const text = content
+      .map((block) => block && block.type === "text" ? block.text || "" : JSON.stringify(block || {}))
+      .join("\\n");
+    const required = [
+      "combat loop",
+      "entity-component design",
+      "save/load schema",
+      "asset pipeline",
+      "performance budget",
+      "automated test plan",
+      "ALPHA-BRAVO-CHARLIE-7742",
+      "NESTED-DOWNSTREAM-MARKER-9921"
+    ];
+    const report = {
+      textLength: text.length,
+      required: Object.fromEntries(required.map((item) => [item, text.includes(item)]))
+    };
+    const result = "LONG_CONTEXT_REPORT:" + JSON.stringify(report);
+    process.stdout.write(JSON.stringify({
+      type: "assistant",
+      session_id: "fake-cli-session",
+      message: { role: "assistant", content: [{ type: "text", text: result }] }
+    }) + "\\n");
+    process.stdout.write(JSON.stringify({
+      type: "result",
+      session_id: "fake-cli-session",
+      result,
+      usage: {
+        input_tokens: Math.ceil(text.length / 4),
+        output_tokens: 24,
+        cache_creation_input_tokens: 128,
+        cache_read_input_tokens: 0
+      },
+      total_cost_usd: 0,
       duration_ms: 10,
       num_turns: 1,
       is_error: false
@@ -797,14 +1074,14 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       }
     });
 
-    it("rejects client-supplied Anthropic tools instead of prompt-emulating them", async () => {
-      const fakeClaude = writeFakeClaudeCommand("SHOULD_NOT_RUN");
+    it("bridges client-supplied Anthropic tools through a real MCP tool call and resumes with tool_result", async () => {
+      const fakeClaude = writeMcpToolCallingClaudeCommand();
       const proc = await startTestServer(ANTHROPIC_PORT, {
         CC_PROXY_API_KEY: "test-secret",
         CLAUDE_COMMAND: fakeClaude,
       });
       try {
-        const res = await httpPost(
+        const first = await httpPost(
           `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
           {
             model: "claude-sonnet-4-6",
@@ -819,15 +1096,227 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
                 },
               },
             ],
-            messages: [{ role: "user", content: "Use the tool." }],
+            messages: [
+              {
+                role: "user",
+                content:
+                  "Use lookup_frame_budget for a Nintendo Switch action RPG frame-budget check.",
+              },
+            ],
           },
           { Authorization: "Bearer test-secret" }
         );
-        assert.equal(res.status, 501);
-        const body = JSON.parse(res.body);
-        assert.equal(body.type, "error");
-        assert.equal(body.error.type, "not_supported_error");
-        assert.match(body.error.message, /client-supplied tools/i);
+        assert.equal(first.status, 200, first.body);
+        const firstBody = JSON.parse(first.body);
+        assert.equal(firstBody.type, "message");
+        assert.equal(firstBody.stop_reason, "tool_use");
+        assert.equal(firstBody.content[0].type, "tool_use");
+        assert.equal(firstBody.content[0].id, "toolu_frame_budget_001");
+        assert.equal(firstBody.content[0].name, "lookup_frame_budget");
+        assert.deepEqual(firstBody.content[0].input, { platform: "switch" });
+
+        const second = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 256,
+            messages: [
+              {
+                role: "user",
+                content:
+                  "Use lookup_frame_budget for a Nintendo Switch action RPG frame-budget check.",
+              },
+              {
+                role: "assistant",
+                content: firstBody.content,
+              },
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: "toolu_frame_budget_001",
+                    content:
+                      "Switch handheld budget: keep simulation plus render under 16.67ms, reserve 2ms for streaming.",
+                  },
+                ],
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(second.status, 200, second.body);
+        const secondBody = JSON.parse(second.body);
+        assert.equal(secondBody.stop_reason, "end_turn");
+        assert.match(
+          secondBody.content[0].text,
+          /CLIENT_TOOL_RESULT:Switch handheld budget/
+        );
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("keeps client-supplied tool sessions one-shot even when keep-session is requested", async () => {
+      const fakeClaude = writeMcpToolCallingClaudeCommand();
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const first = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            tools: [
+              {
+                name: "lookup_frame_budget",
+                description: "Look up a game frame budget.",
+                input_schema: {
+                  type: "object",
+                  properties: { platform: { type: "string" } },
+                },
+              },
+            ],
+            messages: [
+              {
+                role: "user",
+                content:
+                  "Use lookup_frame_budget for a Nintendo Switch action RPG frame-budget check.",
+              },
+            ],
+          },
+          {
+            Authorization: "Bearer test-secret",
+            "x-cc-keep-session": "true",
+          }
+        );
+        assert.equal(first.status, 200, first.body);
+        assert.equal(first.headers["x-cc-session-id"], undefined);
+
+        const firstBody = JSON.parse(first.body);
+        const second = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            messages: [
+              {
+                role: "user",
+                content:
+                  "Use lookup_frame_budget for a Nintendo Switch action RPG frame-budget check.",
+              },
+              { role: "assistant", content: firstBody.content },
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: "toolu_frame_budget_001",
+                    content: "Switch handheld budget: keep the game under 16.67ms.",
+                  },
+                ],
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(second.status, 200, second.body);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("streams client-supplied tool_use and streams the resumed tool_result answer", async () => {
+      const fakeClaude = writeMcpToolCallingClaudeCommand(1400);
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const first = await httpPostChunked(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            stream: true,
+            tools: [
+              {
+                name: "lookup_frame_budget",
+                description: "Look up a game frame budget.",
+                input_schema: {
+                  type: "object",
+                  properties: { platform: { type: "string" } },
+                },
+              },
+            ],
+            messages: [
+              {
+                role: "user",
+                content:
+                  "Use lookup_frame_budget for a Nintendo Switch action RPG frame-budget check.",
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(first.status, 200, first.body);
+        assert.match(String(first.headers["content-type"]), /^text\/event-stream/);
+        assert.match(first.body, /toolu_frame_budget_001/);
+        assert.match(first.body, /"stop_reason":"tool_use"/);
+        assert.ok(first.chunks.length > 0, "stream should produce tool_use chunks");
+        assert.ok(
+          first.chunks[0].atMs < 1000,
+          `first tool_use SSE chunk should arrive live before delayed message_stop, got ${first.chunks[0].atMs}ms`
+        );
+
+        const second = await httpPostChunked(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 256,
+            stream: true,
+            messages: [
+              {
+                role: "user",
+                content:
+                  "Use lookup_frame_budget for a Nintendo Switch action RPG frame-budget check.",
+              },
+              {
+                role: "assistant",
+                content: [
+                  {
+                    type: "tool_use",
+                    id: "toolu_frame_budget_001",
+                    name: "lookup_frame_budget",
+                    input: { platform: "switch" },
+                  },
+                ],
+              },
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: "toolu_frame_budget_001",
+                    content:
+                      "Switch docked budget: use 16.67ms total, with 3ms reserved for render spikes.",
+                  },
+                ],
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(second.status, 200, second.body);
+        assert.match(String(second.headers["content-type"]), /^text\/event-stream/);
+        assert.match(second.body, /CLIENT_TOOL_RESULT:Switch docked budget/);
+        assert.match(second.body, /event: message_stop/);
       } finally {
         proc.kill("SIGKILL");
         await sleep(300);
@@ -904,6 +1393,72 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.equal(body.content[0].signature, "sig_native_probe");
         assert.equal(body.content[1].type, "text");
         assert.equal(body.content[1].text, "CONTENT_TYPES:image,text");
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("passes long game-development context through /v1/messages without proxy-side truncation", async () => {
+      const fakeClaude = writeLongContextInspectingClaudeCommand();
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      const sections = [
+        "combat loop",
+        "entity-component design",
+        "save/load schema",
+        "asset pipeline",
+        "performance budget",
+        "automated test plan",
+      ];
+      const longContext = Array.from({ length: 36 }, (_, index) => {
+        const section = sections[index % sections.length];
+        return [
+          `Iteration ${index + 1}: ${section}.`,
+          "Build a small action RPG prototype with deterministic rollback-safe combat timing, spawn tables, hit-stop windows, and animation cancel rules.",
+          "Track entities through component ownership, serialization boundaries, asset import fingerprints, memory budgets, frame spikes, and smoke tests.",
+          "Keep markers ALPHA-BRAVO-CHARLIE-7742 and NESTED-DOWNSTREAM-MARKER-9921 visible for downstream read-hook validation.",
+        ].join(" ");
+      }).join("\\n");
+
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 512,
+            system:
+              "You are validating a game development assistant proxy. Preserve technical details from the user context.",
+            messages: [
+              {
+                role: "user",
+                content:
+                  `${longContext}\n\nWrite a non-trivial review covering combat loop, entity-component design, save/load schema, asset pipeline, performance budget, and automated test plan.`,
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200, res.body);
+        const body = JSON.parse(res.body);
+        const text = body.content?.[0]?.text || "";
+        assert.match(text, /^LONG_CONTEXT_REPORT:/);
+        const report = JSON.parse(text.replace(/^LONG_CONTEXT_REPORT:/, ""));
+        assert.ok(
+          report.textLength > 15_000,
+          `expected long context to reach fake Claude, got ${report.textLength}`
+        );
+        for (const section of [
+          ...sections,
+          "ALPHA-BRAVO-CHARLIE-7742",
+          "NESTED-DOWNSTREAM-MARKER-9921",
+        ]) {
+          assert.equal(report.required[section], true, `missing ${section}`);
+        }
+        assert.ok(body.usage.input_tokens > 3_000);
       } finally {
         proc.kill("SIGKILL");
         await sleep(300);

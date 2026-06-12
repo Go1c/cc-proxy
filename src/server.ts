@@ -9,8 +9,15 @@ import {
   ClaudeStreamMessage,
   HookPayload,
   PreToolUseOutput,
+  TurnResult,
 } from "./types";
 import { SessionManager, CapacityError, MAX_SESSIONS } from "./session-manager";
+import {
+  ClientToolBridge,
+  ClientToolSpec,
+  ClientToolTurn,
+  extractToolResults,
+} from "./client-tool-bridge";
 
 const PORT = parseInt(process.env.PORT || process.env.CC_PROXY_PORT || "3456", 10);
 const DOWNSTREAM_ROOT = path.resolve(
@@ -26,6 +33,16 @@ const CLIENT_API_KEY = process.env.CC_PROXY_API_KEY || "";
 fs.mkdirSync(TEMP_DIR, { recursive: true });
 
 const sessions = new SessionManager(SESSION_CWD);
+
+interface PendingClientToolTurn {
+  turn: ClientToolTurn;
+  finalPromise: Promise<TurnResult>;
+  sessionId: string;
+  closeAfterFinal: boolean;
+}
+
+const clientToolBridges = new Map<string, ClientToolBridge>();
+const pendingClientToolTurns = new Map<string, PendingClientToolTurn>();
 
 // ---- Logging ----
 
@@ -191,6 +208,66 @@ function requireClientAuth(
   return false;
 }
 
+function normalizeClientTools(tools: any): ClientToolSpec[] {
+  if (!Array.isArray(tools)) return [];
+  return tools
+    .filter((tool) => tool && typeof tool === "object")
+    .map((tool) => ({
+      name: String(tool.name || ""),
+      description:
+        typeof tool.description === "string" ? tool.description : undefined,
+      input_schema: tool.input_schema || { type: "object" },
+    }))
+    .filter((tool) => tool.name);
+}
+
+function makeClientToolMcpConfig(bridge: ClientToolBridge): string {
+  return JSON.stringify({
+    mcpServers: {
+      cc_client_tools: {
+        type: "stdio",
+        command: process.execPath,
+        args: [path.join(__dirname, "client-tool-mcp-server.js")],
+        env: {
+          CC_PROXY_CLIENT_TOOL_BRIDGE_URL: `http://127.0.0.1:${PORT}/internal/tool-bridge/${bridge.id}`,
+          CC_PROXY_CLIENT_TOOL_BRIDGE_TOKEN: bridge.token,
+        },
+      },
+    },
+  });
+}
+
+function makeClientToolAllowedTools(tools: ClientToolSpec[]): string[] {
+  return tools.map((tool) => `mcp__cc_client_tools__${tool.name}`);
+}
+
+function findPendingClientToolTurn(toolUseIds: string[]): PendingClientToolTurn | null {
+  for (const id of toolUseIds) {
+    const pending = pendingClientToolTurns.get(id);
+    if (pending) return pending;
+  }
+  return null;
+}
+
+function registerPendingClientToolTurn(pending: PendingClientToolTurn): void {
+  for (const id of pending.turn.toolUseIds) {
+    pendingClientToolTurns.set(id, pending);
+  }
+}
+
+function cleanupPendingClientToolTurn(pending: PendingClientToolTurn): void {
+  for (const id of pending.turn.toolUseIds) {
+    if (pendingClientToolTurns.get(id) === pending) {
+      pendingClientToolTurns.delete(id);
+    }
+  }
+  pending.turn.bridge.dispose();
+  clientToolBridges.delete(pending.turn.bridge.id);
+  if (pending.closeAfterFinal) {
+    sessions.close(pending.sessionId);
+  }
+}
+
 function contentBlockToText(block: any): string {
   if (!block || typeof block !== "object") return String(block ?? "");
   if (block.type === "text" && typeof block.text === "string") return block.text;
@@ -257,7 +334,13 @@ function addContextToFirstUserMessage(
 }
 
 function buildTurnInputFromAnthropicMessages(body: any):
-  | { ok: true; messages: ClaudeStreamMessage[]; model: string; effort?: string }
+  | {
+      ok: true;
+      messages: ClaudeStreamMessage[];
+      model: string;
+      effort?: string;
+      tools: ClientToolSpec[];
+    }
   | { ok: false; status?: number; type?: string; message: string } {
   if (!body || typeof body !== "object") {
     return { ok: false, message: "Request body must be a JSON object" };
@@ -268,16 +351,7 @@ function buildTurnInputFromAnthropicMessages(body: any):
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     return { ok: false, message: "Missing non-empty 'messages' array" };
   }
-  if (Array.isArray(body.tools) && body.tools.length > 0) {
-    return {
-      ok: false,
-      status: 501,
-      type: "not_supported_error",
-      message:
-        "client-supplied tools are not supported by this Claude Code proxy yet. " +
-        "Claude Code workspace tools still run normally, but per-request Anthropic function tools require a real tool_use/tool_result bridge.",
-    };
-  }
+  const tools = normalizeClientTools(body.tools);
 
   const contextParts: string[] = [];
   if (body.system) {
@@ -299,6 +373,7 @@ function buildTurnInputFromAnthropicMessages(body: any):
     messages: addContextToFirstUserMessage(messages, contextParts.join("\n\n")),
     model: body.model,
     effort: thinkingToClaudeEffort(body.thinking),
+    tools,
   };
 }
 
@@ -490,6 +565,134 @@ function sendSseContentBlock(
   });
 }
 
+async function handleClientToolBridgeRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  pathname: string
+): Promise<void> {
+  const match = pathname.match(/^\/internal\/tool-bridge\/([^/]+)\/(tools|call)$/);
+  if (!match) {
+    sendJson(res, 404, { error: "tool bridge route not found" });
+    return;
+  }
+
+  const bridge = clientToolBridges.get(match[1]);
+  const authorization = headerValue(req, "authorization");
+  if (!bridge || authorization !== `Bearer ${bridge.token}`) {
+    sendJson(res, 401, { error: "unauthorized" });
+    return;
+  }
+
+  if (req.method === "GET" && match[2] === "tools") {
+    sendJson(res, 200, bridge.tools);
+    return;
+  }
+
+  if (req.method === "POST" && match[2] === "call") {
+    const bodyText = await readBody(req);
+    let body: any;
+    try {
+      body = JSON.parse(bodyText);
+    } catch {
+      sendJson(res, 400, { error: "invalid JSON body" });
+      return;
+    }
+    try {
+      const result = await bridge.waitForCall(body.name, body.input || {});
+      sendJson(res, 200, result);
+    } catch (err: any) {
+      sendJson(res, 504, {
+        content: [{ type: "text", text: err.message || "tool call failed" }],
+        isError: true,
+      });
+    }
+    return;
+  }
+
+  sendJson(res, 405, { error: "method not allowed" });
+}
+
+async function handleClientToolResultTurn(
+  body: any,
+  res: http.ServerResponse,
+  requestId: string,
+  pending: PendingClientToolTurn,
+  toolResults: ReturnType<typeof extractToolResults>
+): Promise<void> {
+  const missing = [...pending.turn.toolUseIds].filter((id) => {
+    return !toolResults.some((result) => result.tool_use_id === id);
+  });
+  if (missing.length > 0) {
+    sendAnthropicError(
+      res,
+      400,
+      "invalid_request_error",
+      `Missing tool_result for tool_use_id: ${missing.join(", ")}`,
+      requestId
+    );
+    return;
+  }
+
+  const responseHeaders: Record<string, string> = { "request-id": requestId };
+  let streamedLiveEvents = false;
+  if (body.stream === true) {
+    pending.turn.streamSink = (event, raw) => {
+      streamedLiveEvents = true;
+      if (raw?.session_id) {
+        responseHeaders["x-cc-cli-session-id"] = raw.session_id;
+      }
+      writeAnthropicStreamHead(res, responseHeaders);
+      sendSseEvent(res, event.type || "message", event);
+    };
+  }
+
+  for (const result of toolResults) {
+    if (pending.turn.toolUseIds.has(result.tool_use_id)) {
+      pending.turn.bridge.deliverToolResult(result);
+    }
+  }
+
+  try {
+    const result = await pending.finalPromise;
+    responseHeaders["x-cc-cli-session-id"] = result.session_id;
+    if (result.is_error) {
+      if (res.headersSent) {
+        sendSseEvent(res, "error", {
+          type: "error",
+          error: {
+            type: "api_error",
+            message: result.result || "Claude Code turn failed",
+          },
+        });
+        res.end();
+      } else {
+        sendAnthropicError(
+          res,
+          502,
+          "api_error",
+          result.result || "Claude Code turn failed",
+          requestId
+        );
+      }
+      return;
+    }
+
+    const message = makeAnthropicMessage(pending.turn.model, result);
+    if (body.stream === true) {
+      writeAnthropicStreamHead(res, responseHeaders);
+      if (!streamedLiveEvents) {
+        sendBufferedAnthropicStreamEvents(res, message);
+      }
+      res.end();
+    } else {
+      sendJson(res, 200, message, responseHeaders);
+    }
+  } finally {
+    pending.turn.streamSink = undefined;
+    cleanupPendingClientToolTurn(pending);
+  }
+}
+
 async function handleAnthropicMessages(
   req: http.IncomingMessage,
   res: http.ServerResponse
@@ -504,6 +707,17 @@ async function handleAnthropicMessages(
   } catch {
     sendAnthropicError(res, 400, "invalid_request_error", "Invalid JSON body", requestId);
     return;
+  }
+
+  const toolResults = extractToolResults(body);
+  if (toolResults.length > 0) {
+    const pending = findPendingClientToolTurn(
+      toolResults.map((result) => result.tool_use_id)
+    );
+    if (pending) {
+      await handleClientToolResultTurn(body, res, requestId, pending, toolResults);
+      return;
+    }
   }
 
   const turnInputResult = buildTurnInputFromAnthropicMessages(body);
@@ -522,6 +736,8 @@ async function handleAnthropicMessages(
   const keepSession = headerValue(req, "x-cc-keep-session").toLowerCase() === "true";
   let sessionId = requestedSessionId;
   let closeAfterTurn = false;
+  let closeInFinally = true;
+  let bridge: ClientToolBridge | null = null;
 
   try {
     if (sessionId) {
@@ -535,35 +751,120 @@ async function handleAnthropicMessages(
         );
         return;
       }
+      if (turnInputResult.tools.length > 0) {
+        sendAnthropicError(
+          res,
+          400,
+          "invalid_request_error",
+          "client-supplied tools require a new Claude Code session so the proxy can attach a per-request MCP bridge",
+          requestId
+        );
+        return;
+      }
     } else {
+      if (turnInputResult.tools.length > 0) {
+        bridge = new ClientToolBridge(turnInputResult.tools);
+        clientToolBridges.set(bridge.id, bridge);
+      }
       const info = sessions.create({
         model: turnInputResult.model,
         effort: turnInputResult.effort,
+        ...(bridge
+          ? {
+              mcpConfig: makeClientToolMcpConfig(bridge),
+              strictMcpConfig: true,
+              allowedTools: makeClientToolAllowedTools(turnInputResult.tools),
+            }
+          : {}),
       });
       sessionId = info.id;
-      closeAfterTurn = !keepSession;
+      closeAfterTurn = !!bridge || !keepSession;
     }
 
     const responseHeaders: Record<string, string> = { "request-id": requestId };
     if (!closeAfterTurn) responseHeaders["x-cc-session-id"] = sessionId;
 
     let streamedLiveEvents = false;
-    const result = await sessions.turn(
+    const clientToolTurn = bridge
+      ? new ClientToolTurn(
+          bridge,
+          turnInputResult.model,
+          sessionId,
+          closeAfterTurn
+        )
+      : null;
+    if (clientToolTurn && body.stream === true) {
+      clientToolTurn.streamSink = (event, raw) => {
+        streamedLiveEvents = true;
+        if (raw?.session_id) {
+          responseHeaders["x-cc-cli-session-id"] = raw.session_id;
+        }
+        writeAnthropicStreamHead(res, responseHeaders);
+        sendSseEvent(res, event.type || "message", event);
+      };
+    }
+    const finalPromise = sessions.turn(
       sessionId,
       turnInputResult.messages,
-      body.stream === true
+      clientToolTurn
         ? {
             onStreamEvent: (event, raw) => {
-              streamedLiveEvents = true;
               if (raw?.session_id) {
                 responseHeaders["x-cc-cli-session-id"] = raw.session_id;
               }
-              writeAnthropicStreamHead(res, responseHeaders);
-              sendSseEvent(res, event.type || "message", event);
+              clientToolTurn.handleStreamEvent(event, raw);
             },
           }
-        : {}
+        : body.stream === true
+          ? {
+              onStreamEvent: (event, raw) => {
+                streamedLiveEvents = true;
+                if (raw?.session_id) {
+                  responseHeaders["x-cc-cli-session-id"] = raw.session_id;
+                }
+                writeAnthropicStreamHead(res, responseHeaders);
+                sendSseEvent(res, event.type || "message", event);
+              },
+            }
+          : {}
     );
+    finalPromise.catch(() => {
+      /* handled by request flow or follow-up tool_result flow */
+    });
+
+    if (clientToolTurn) {
+      const firstOutcome = await Promise.race([
+        finalPromise.then((result) => ({ type: "final" as const, result })),
+        clientToolTurn.initialReady.then(() => ({ type: "tool_use" as const })),
+      ]);
+
+      if (firstOutcome.type === "tool_use") {
+        const pending: PendingClientToolTurn = {
+          turn: clientToolTurn,
+          finalPromise,
+          sessionId,
+          closeAfterFinal: closeAfterTurn,
+        };
+        registerPendingClientToolTurn(pending);
+        closeInFinally = false;
+
+        if (body.stream === true) {
+          writeAnthropicStreamHead(res, responseHeaders);
+          if (!streamedLiveEvents) {
+            for (const event of clientToolTurn.bufferedEvents) {
+              sendSseEvent(res, event.type || "message", event);
+            }
+          }
+          res.end();
+          clientToolTurn.streamSink = undefined;
+        } else {
+          sendJson(res, 200, clientToolTurn.makeInitialMessage(), responseHeaders);
+        }
+        return;
+      }
+    }
+
+    const result = await finalPromise;
     responseHeaders["x-cc-cli-session-id"] = result.session_id;
     if (result.is_error) {
       if (res.headersSent) {
@@ -614,7 +915,11 @@ async function handleAnthropicMessages(
       sendAnthropicError(res, 500, "api_error", err.message || "request failed", requestId);
     }
   } finally {
-    if (closeAfterTurn && sessionId) sessions.close(sessionId);
+    if (closeInFinally && closeAfterTurn && sessionId) sessions.close(sessionId);
+    if (closeInFinally && bridge) {
+      bridge.dispose();
+      clientToolBridges.delete(bridge.id);
+    }
   }
 }
 
@@ -683,6 +988,11 @@ const server = http.createServer(async (req, res) => {
         sessions: sessions.size,
         max_sessions: MAX_SESSIONS,
       });
+      return;
+    }
+
+    if (pathname.startsWith("/internal/tool-bridge/")) {
+      await handleClientToolBridgeRequest(req, res, pathname);
       return;
     }
 
