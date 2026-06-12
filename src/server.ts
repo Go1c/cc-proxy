@@ -1218,6 +1218,15 @@ async function handleAdminRequest(
     return true;
   }
 
+  if (req.method === "GET" && pathname === "/admin/status") {
+    sendJson(res, 200, {
+      admin: {
+        configured: controlPlane.configured,
+      },
+    });
+    return true;
+  }
+
   if (req.method === "POST" && pathname === "/admin/setup") {
     if (controlPlane.configured) {
       sendJson(res, 409, { error: "admin already configured" });

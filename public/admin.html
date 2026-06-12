@@ -646,6 +646,7 @@
               <h2>管理员</h2>
               <p>首次部署用初始化，后续用登录。</p>
             </div>
+            <span class="status" id="adminBootstrapState">checking</span>
           </div>
           <div class="form-grid one">
             <label>用户名
@@ -891,6 +892,7 @@
         skipAuth: true,
       });
       setToken(body.token);
+      await loadAdminStatus(false);
       setNotice("authNotice", "已登录", "ok");
       await refreshAll();
     }
@@ -899,6 +901,26 @@
       setToken("");
       setNotice("authNotice", "已退出");
       stopAuthPolling();
+      loadAdminStatus(false).catch(() => {});
+    }
+
+    async function loadAdminStatus(updateNotice = true) {
+      const { admin } = await api("/admin/status", { skipAuth: true });
+      const configured = !!admin.configured;
+      $("adminBootstrapState").textContent = configured ? "已初始化" : "未初始化";
+      $("adminBootstrapState").className = `status ${configured ? "ready" : "warning"}`;
+      $("setupButton").disabled = configured;
+      $("loginButton").disabled = !configured;
+      if (updateNotice) {
+        setNotice(
+          "authNotice",
+          configured
+            ? "管理员已存在，请登录；密码不匹配时说明当前 Volume 里已有其他管理员密码。"
+            : "首次部署还没有管理员，请先初始化。",
+          configured ? "" : "error"
+        );
+      }
+      return configured;
     }
 
     async function loadConfig() {
@@ -1281,6 +1303,7 @@
     };
 
     setToken(token);
+    loadAdminStatus().catch((err) => setNotice("authNotice", err.message, "error"));
     refreshAll().catch(() => {});
     setInterval(refreshRuntime, 10000);
   </script>

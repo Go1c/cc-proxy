@@ -1853,6 +1853,35 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       }
     });
 
+    it("exposes public admin bootstrap status without leaking credentials", async () => {
+      const dataDir = makeIsolatedDataDir("admin-bootstrap-status");
+      const proc = await startTestServer(ZEABUR_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+      });
+      try {
+        const baseUrl = `http://localhost:${ZEABUR_PORT}`;
+
+        const initial = await httpGet(`${baseUrl}/admin/status`);
+        assert.equal(initial.status, 200, initial.body);
+        const initialBody = JSON.parse(initial.body);
+        assert.equal(initialBody.admin.configured, false);
+        assert.equal("password_hash" in initialBody.admin, false);
+        assert.equal("password_salt" in initialBody.admin, false);
+
+        await bootstrapAdmin(baseUrl);
+
+        const configured = await httpGet(`${baseUrl}/admin/status`);
+        assert.equal(configured.status, 200, configured.body);
+        const configuredBody = JSON.parse(configured.body);
+        assert.equal(configuredBody.admin.configured, true);
+        assert.equal("password_hash" in configuredBody.admin, false);
+        assert.equal("password_salt" in configuredBody.admin, false);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+      }
+    });
+
     it("serves the administrator web console from /admin", async () => {
       const dataDir = makeIsolatedDataDir("admin-web-console");
       const proc = await startTestServer(ZEABUR_PORT, {
@@ -1874,6 +1903,8 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.match(res.body, /logLevelFilter/);
         assert.match(res.body, /storageDataDir/);
         assert.match(res.body, /\/admin\/system/);
+        assert.match(res.body, /adminBootstrapState/);
+        assert.match(res.body, /\/admin\/status/);
       } finally {
         proc.kill("SIGKILL");
         await sleep(300);
