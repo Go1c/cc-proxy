@@ -367,7 +367,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       });
       try {
         const res = await httpPost(`http://localhost:${ANTHROPIC_PORT}/v1/messages`, {
-          model: "claude-sonnet-4-5",
+          model: "claude-sonnet-4-6",
           max_tokens: 128,
           messages: [{ role: "user", content: "hello" }],
         });
@@ -389,7 +389,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         const res = await httpPost(
           `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
           {
-            model: "claude-sonnet-4-5",
+            model: "claude-sonnet-4-6",
             max_tokens: 128,
             messages: [],
           },
@@ -413,7 +413,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         const res = await httpPost(
           `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
           {
-            model: "claude-sonnet-4-5",
+            model: "claude-sonnet-4-6",
             max_tokens: 128,
             messages: [],
           },
@@ -439,7 +439,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         const res = await httpPost(
           `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
           {
-            model: "claude-sonnet-4-5",
+            model: "claude-sonnet-4-6",
             max_tokens: 128,
             stream: true,
             messages: [{ role: "user", content: "hello" }],
@@ -468,7 +468,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       try {
         const res = await httpPost(
           `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
-          { model: "claude-sonnet-4-5", max_tokens: 128, messages: [] },
+          { model: "claude-sonnet-4-6", max_tokens: 128, messages: [] },
           { "x-api-key": "test-secret" }
         );
         assert.equal(res.status, 400);
