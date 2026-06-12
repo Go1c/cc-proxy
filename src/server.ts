@@ -1446,6 +1446,22 @@ async function handleAdminRequest(
     return true;
   }
 
+  if (req.method === "DELETE" && pathname === "/admin/claude-auth") {
+    try {
+      const snapshot = claudeAuthJob.cancel();
+      auditLog.record("warn", "claude_auth.cancelled", "Claude account auth job cancelled by admin", {
+        command: snapshot.command,
+        args: snapshot.args,
+      });
+      sendJson(res, 200, { auth: snapshot });
+    } catch (err: any) {
+      sendJson(res, err.message?.includes("not running") ? 409 : 400, {
+        error: err.message || "failed to cancel Claude auth job",
+      });
+    }
+    return true;
+  }
+
   if (req.method === "GET" && pathname === "/admin/cli-windows") {
     const config = controlPlane.getConfig();
     sendJson(res, 200, {

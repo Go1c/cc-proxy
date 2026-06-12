@@ -1626,6 +1626,55 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       }
     });
 
+    it("cancels a stuck Claude account auth job and allows a new job to start", async () => {
+      const dataDir = makeIsolatedDataDir("claude-auth-cancel");
+      const envPath = path.join(dataDir, "claude-auth-env.json");
+      const fakeClaude = writeEnvRecordingClaudeCommand(envPath);
+      const proc = await startTestServer(ZEABUR_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const baseUrl = `http://localhost:${ZEABUR_PORT}`;
+        const adminToken = await bootstrapAdmin(baseUrl);
+
+        const started = await httpPost(
+          `${baseUrl}/admin/claude-auth/login`,
+          {},
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(started.status, 202, started.body);
+        assert.equal(JSON.parse(started.body).auth.status, "running");
+
+        const secondStart = await httpPost(
+          `${baseUrl}/admin/claude-auth/login`,
+          {},
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(secondStart.status, 409, secondStart.body);
+
+        const cancelled = await httpDelete(`${baseUrl}/admin/claude-auth`, {
+          Authorization: `Bearer ${adminToken}`,
+        });
+        assert.equal(cancelled.status, 200, cancelled.body);
+        const cancelledBody = JSON.parse(cancelled.body);
+        assert.equal(cancelledBody.auth.status, "cancelled");
+        assert.match(cancelledBody.auth.log, /admin cancelled auth job/);
+
+        const restarted = await httpPost(
+          `${baseUrl}/admin/claude-auth/check`,
+          {},
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(restarted.status, 202, restarted.body);
+        assert.equal(JSON.parse(restarted.body).auth.status, "running");
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
     it("creates downstream API keys from the admin backend and records visible admin logs", async () => {
       const dataDir = makeIsolatedDataDir("admin-api-keys-logs");
       const proc = await startTestServer(ZEABUR_PORT, {
@@ -1899,6 +1948,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.match(res.body, /deleteKey/);
         assert.match(res.body, /claudeAuthInput/);
         assert.match(res.body, /\/admin\/claude-auth\/input/);
+        assert.match(res.body, /cancelClaudeAuthButton/);
         assert.match(res.body, /copyCreatedKeyButton/);
         assert.match(res.body, /logLevelFilter/);
         assert.match(res.body, /storageDataDir/);

@@ -1,6 +1,6 @@
 import { spawn, ChildProcess } from "child_process";
 
-export type ClaudeAuthJobStatus = "idle" | "running" | "succeeded" | "failed";
+export type ClaudeAuthJobStatus = "idle" | "running" | "succeeded" | "failed" | "cancelled";
 
 export interface ClaudeAuthJobSnapshot {
   status: ClaudeAuthJobStatus;
@@ -88,6 +88,28 @@ export class ClaudeAuthJob {
     return this.snapshot();
   }
 
+  cancel(): ClaudeAuthJobSnapshot {
+    if (!this.proc || this.state.status !== "running") {
+      throw new Error("Claude auth job is not running");
+    }
+    const proc = this.proc;
+    let exited = false;
+    proc.once("exit", () => {
+      exited = true;
+    });
+    this.appendLog("\n[admin cancelled auth job]\n");
+    this.state.status = "cancelled";
+    this.state.completed_at = new Date().toISOString();
+    this.state.exit_code = null;
+    this.state.signal = "SIGTERM";
+    this.proc = null;
+    proc.kill("SIGTERM");
+    setTimeout(() => {
+      if (!exited) proc.kill("SIGKILL");
+    }, 2000).unref();
+    return this.snapshot();
+  }
+
   snapshot(): ClaudeAuthJobSnapshot {
     return {
       ...this.state,
@@ -103,7 +125,7 @@ export class ClaudeAuthJob {
   }
 
   private finish(
-    status: Exclude<ClaudeAuthJobStatus, "idle" | "running">,
+    status: Exclude<ClaudeAuthJobStatus, "idle" | "running" | "cancelled">,
     code: number | null,
     signal: NodeJS.Signals | null
   ): void {

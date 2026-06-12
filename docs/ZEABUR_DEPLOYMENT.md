@@ -172,5 +172,6 @@ curl https://你的域名/health
 - `/admin` 500：镜像里缺 `public/admin.html`，检查 Dockerfile 是否有 `COPY public ./public`。
 - `unauthorized`：管理员会话失效，重新登录即可；不需要重新初始化管理员。服务重启/重部署会清掉内存会话 token，但不会清掉已经落盘的管理员账号。
 - 重部署后管理员/key 丢失：没有挂载 `/data`，或旧版本写到了容器内 `.cc-proxy-data`。升级后进 `/admin` 看“管理员”区域是否显示“已初始化”，再看“存储 / 持久化”确认数据目录是 `/data/cc-proxy`。如果显示“未初始化”，重新创建一次管理员和 API Key，之后会跟随 Zeabur Volume 持久保存。
+- Claude Auth 一直显示 running 或 `Claude auth job is already running`：上一轮登录进程还没退出，点击 Claude 登录认证区域里的“取消任务”，再重新开始登录。
 - Claude 未登录：进 `/admin` 的 Claude Auth 执行登录/检查，确认登录参数是 `setup-token`，并确认 `/data/cc-proxy/claude-home` 在持久化卷里。
 - 下游 401：必须使用后台 API Keys 新建出来的 key。

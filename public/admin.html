@@ -550,6 +550,7 @@
             <div class="actions">
               <button id="claudeLoginButton" type="button">开始登录</button>
               <button class="secondary" id="claudeAuthCheckButton" type="button">检查认证</button>
+              <button class="danger" id="cancelClaudeAuthButton" type="button" disabled>取消任务</button>
             </div>
           </div>
 
@@ -985,6 +986,7 @@
         ? `started ${formatDateTime(auth.started_at)}`
         : "-";
       $("claudeAuthInputButton").disabled = status !== "running";
+      $("cancelClaudeAuthButton").disabled = status !== "running";
       const logText = [
         auth.command ? `$ ${auth.command} ${(auth.args || []).join(" ")}` : "",
         auth.started_at ? `started: ${auth.started_at}` : "",
@@ -1002,6 +1004,15 @@
       setNotice("claudeAuthNotice", "认证任务已启动", "ok");
       await api(path, { method: "POST", body: "{}" });
       await loadClaudeAuth();
+    }
+
+    async function cancelClaudeAuth() {
+      const { auth } = await api("/admin/claude-auth", { method: "DELETE" });
+      setNotice("claudeAuthNotice", "认证任务已取消", "ok");
+      $("claudeAuthInputButton").disabled = true;
+      $("cancelClaudeAuthButton").disabled = true;
+      await loadClaudeAuth();
+      return auth;
     }
 
     async function submitClaudeAuthInput() {
@@ -1255,7 +1266,7 @@
     function statusClass(state) {
       if (["ready", "succeeded", "active", "info"].includes(state)) return "ready";
       if (["running", "cooldown", "warn", "warning"].includes(state)) return "running";
-      if (["failed", "closed", "error", "banned", "locked"].includes(state)) return "error";
+      if (["failed", "closed", "error", "banned", "locked", "cancelled"].includes(state)) return "error";
       return "";
     }
 
@@ -1279,6 +1290,7 @@
     $("saveConfigButton").onclick = () => runAction(saveConfig);
     $("claudeLoginButton").onclick = () => runAction(() => startClaudeAuth("/admin/claude-auth/login"), "claudeAuthNotice");
     $("claudeAuthCheckButton").onclick = () => runAction(() => startClaudeAuth("/admin/claude-auth/check"), "claudeAuthNotice");
+    $("cancelClaudeAuthButton").onclick = () => runAction(cancelClaudeAuth, "claudeAuthNotice");
     $("claudeAuthInputButton").onclick = () => runAction(submitClaudeAuthInput, "claudeAuthNotice");
     $("copyClaudeAuthLogButton").onclick = () => copyText($("claudeAuthLog").textContent, "claudeAuthNotice");
     $("createKeyButton").onclick = () => runAction(createKey);
