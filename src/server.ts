@@ -16,16 +16,6 @@ const SESSION_CWD = path.resolve(
 );
 const TEMP_DIR = path.join(os.tmpdir(), "cc-proxy");
 const CLIENT_API_KEY = process.env.CC_PROXY_API_KEY || "";
-const MESSAGES_BACKEND = process.env.CC_MESSAGES_BACKEND || "claude-code";
-const ANTHROPIC_UPSTREAM_BASE_URL = (
-  process.env.CC_ANTHROPIC_BASE_URL || "https://api.anthropic.com"
-).replace(/\/+$/, "");
-const ANTHROPIC_UPSTREAM_API_KEY = process.env.CC_ANTHROPIC_API_KEY || "";
-const ANTHROPIC_UPSTREAM_VERSION =
-  process.env.CC_ANTHROPIC_VERSION || "2023-06-01";
-const ANTHROPIC_UPSTREAM_BETA = process.env.CC_ANTHROPIC_BETA || "";
-const ANTHROPIC_UPSTREAM_AUTH_HEADER =
-  process.env.CC_ANTHROPIC_AUTH_HEADER || "";
 
 // Ensure temp dir exists
 fs.mkdirSync(TEMP_DIR, { recursive: true });
@@ -139,10 +129,6 @@ function sendJson(
   res.end(JSON.stringify(body));
 }
 
-function makeRequestId(): string {
-  return `req_${randomUUID().replace(/-/g, "")}`;
-}
-
 function headerValue(req: http.IncomingMessage, name: string): string {
   const value = req.headers[name.toLowerCase()];
   if (Array.isArray(value)) return value[0] || "";
@@ -162,17 +148,15 @@ function sendAnthropicError(
   res: http.ServerResponse,
   status: number,
   type: string,
-  message: string,
-  headers: Record<string, string> = {}
+  message: string
 ): void {
-  sendJson(res, status, { type: "error", error: { type, message } }, headers);
+  sendJson(res, status, { type: "error", error: { type, message } });
 }
 
 function requireClientAuth(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  responseShape: "anthropic" | "plain",
-  headers: Record<string, string> = {}
+  responseShape: "anthropic" | "plain"
 ): boolean {
   if (!CLIENT_API_KEY) return true;
   if (extractClientApiKey(req) === CLIENT_API_KEY) return true;
@@ -182,69 +166,12 @@ function requireClientAuth(
       res,
       401,
       "authentication_error",
-      "Missing or invalid API key",
-      headers
+      "Missing or invalid API key"
     );
   } else {
     sendJson(res, 401, { error: "unauthorized" });
   }
   return false;
-}
-
-function normalizedMessagesBackend(): "claude-code" | "anthropic" | "hybrid" {
-  if (MESSAGES_BACKEND === "anthropic" || MESSAGES_BACKEND === "hybrid") {
-    return MESSAGES_BACKEND;
-  }
-  return "claude-code";
-}
-
-function hasNativeAnthropicContent(content: any): boolean {
-  if (!Array.isArray(content)) return false;
-  return content.some((block) => {
-    if (!block || typeof block !== "object") return false;
-    return block.type === "image" || block.type === "document";
-  });
-}
-
-function bodyNeedsNativeAnthropicApi(body: any): boolean {
-  if (!body || typeof body !== "object") return false;
-  if (body.thinking != null) return true;
-  if (Array.isArray(body.tools) && body.tools.length > 0) return true;
-  if (body.tool_choice != null) return true;
-  if (!Array.isArray(body.messages)) return false;
-  return body.messages.some((message: any) =>
-    hasNativeAnthropicContent(message?.content)
-  );
-}
-
-function shouldUseAnthropicUpstream(body: any): boolean {
-  const backend = normalizedMessagesBackend();
-  if (backend === "anthropic") return true;
-  if (backend === "hybrid") return bodyNeedsNativeAnthropicApi(body);
-  return false;
-}
-
-function upstreamAuthConfig():
-  | { ok: true; key: string; mode: "x-api-key" | "authorization-bearer" }
-  | { ok: false; message: string } {
-  if (ANTHROPIC_UPSTREAM_API_KEY) {
-    const mode =
-      ANTHROPIC_UPSTREAM_AUTH_HEADER === "authorization-bearer"
-        ? "authorization-bearer"
-        : "x-api-key";
-    return { ok: true, key: ANTHROPIC_UPSTREAM_API_KEY, mode };
-  }
-
-  const oauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN || "";
-  if (oauthToken) {
-    return { ok: true, key: oauthToken, mode: "authorization-bearer" };
-  }
-
-  return {
-    ok: false,
-    message:
-      "CC_MESSAGES_BACKEND requires CC_ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN for upstream Anthropic requests",
-  };
 }
 
 function contentBlockToText(block: any): string {
@@ -322,75 +249,6 @@ function makeAnthropicMessage(model: string, result: any): any {
   };
 }
 
-async function forwardAnthropicMessagesToUpstream(
-  req: http.IncomingMessage,
-  res: http.ServerResponse,
-  bodyText: string,
-  requestId: string
-): Promise<void> {
-  const auth = upstreamAuthConfig();
-  if (!auth.ok) {
-    sendAnthropicError(res, 503, "api_error", auth.message, {
-      "request-id": requestId,
-    });
-    return;
-  }
-
-  const upstreamHeaders: Record<string, string> = {
-    "Content-Type": "application/json",
-    "anthropic-version":
-      headerValue(req, "anthropic-version") || ANTHROPIC_UPSTREAM_VERSION,
-    "user-agent": "cc-proxy/0.1.0",
-  };
-
-  const clientBeta = headerValue(req, "anthropic-beta");
-  if (clientBeta || ANTHROPIC_UPSTREAM_BETA) {
-    upstreamHeaders["anthropic-beta"] = clientBeta || ANTHROPIC_UPSTREAM_BETA;
-  }
-
-  if (auth.mode === "authorization-bearer") {
-    upstreamHeaders.authorization = `Bearer ${auth.key}`;
-  } else {
-    upstreamHeaders["x-api-key"] = auth.key;
-  }
-
-  const upstreamUrl = `${ANTHROPIC_UPSTREAM_BASE_URL}/v1/messages`;
-  const upstreamRes = await fetch(upstreamUrl, {
-    method: "POST",
-    headers: upstreamHeaders,
-    body: bodyText,
-  });
-  const upstreamBody = await upstreamRes.text();
-
-  const responseHeaders: Record<string, string> = {
-    "request-id": upstreamRes.headers.get("request-id") || requestId,
-    "Content-Type":
-      upstreamRes.headers.get("content-type") ||
-      (upstreamBody.trim().startsWith("event:")
-        ? "text/event-stream; charset=utf-8"
-        : "application/json"),
-  };
-
-  const copyHeaders = [
-    "anthropic-ratelimit-requests-limit",
-    "anthropic-ratelimit-requests-remaining",
-    "anthropic-ratelimit-requests-reset",
-    "anthropic-ratelimit-input-tokens-limit",
-    "anthropic-ratelimit-input-tokens-remaining",
-    "anthropic-ratelimit-input-tokens-reset",
-    "anthropic-ratelimit-output-tokens-limit",
-    "anthropic-ratelimit-output-tokens-remaining",
-    "anthropic-ratelimit-output-tokens-reset",
-  ];
-  for (const header of copyHeaders) {
-    const value = upstreamRes.headers.get(header);
-    if (value) responseHeaders[header] = value;
-  }
-
-  res.writeHead(upstreamRes.status, responseHeaders);
-  res.end(upstreamBody);
-}
-
 function sendSseEvent(res: http.ServerResponse, event: string, data: unknown): void {
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -458,30 +316,20 @@ async function handleAnthropicMessages(
   req: http.IncomingMessage,
   res: http.ServerResponse
 ): Promise<void> {
-  const requestId = makeRequestId();
-  if (!requireClientAuth(req, res, "anthropic", { "request-id": requestId })) return;
+  if (!requireClientAuth(req, res, "anthropic")) return;
 
   const bodyText = await readBody(req);
   let body: any;
   try {
     body = JSON.parse(bodyText);
   } catch {
-    sendAnthropicError(res, 400, "invalid_request_error", "Invalid JSON body", {
-      "request-id": requestId,
-    });
-    return;
-  }
-
-  if (shouldUseAnthropicUpstream(body)) {
-    await forwardAnthropicMessagesToUpstream(req, res, bodyText, requestId);
+    sendAnthropicError(res, 400, "invalid_request_error", "Invalid JSON body");
     return;
   }
 
   const promptResult = buildPromptFromAnthropicMessages(body);
   if (!promptResult.ok) {
-    sendAnthropicError(res, 400, "invalid_request_error", promptResult.message, {
-      "request-id": requestId,
-    });
+    sendAnthropicError(res, 400, "invalid_request_error", promptResult.message);
     return;
   }
 
@@ -497,8 +345,7 @@ async function handleAnthropicMessages(
           res,
           404,
           "invalid_request_error",
-          `Unknown x-cc-session-id: ${sessionId}`,
-          { "request-id": requestId }
+          `Unknown x-cc-session-id: ${sessionId}`
         );
         return;
       }
@@ -510,18 +357,11 @@ async function handleAnthropicMessages(
 
     const result = await sessions.turn(sessionId, promptResult.prompt);
     if (result.is_error) {
-      sendAnthropicError(
-        res,
-        502,
-        "api_error",
-        result.result || "Claude Code turn failed",
-        { "request-id": requestId }
-      );
+      sendAnthropicError(res, 502, "api_error", result.result || "Claude Code turn failed");
       return;
     }
 
     const responseHeaders: Record<string, string> = {
-      "request-id": requestId,
       "x-cc-cli-session-id": result.session_id,
     };
     if (!closeAfterTurn) responseHeaders["x-cc-session-id"] = sessionId;
@@ -534,14 +374,10 @@ async function handleAnthropicMessages(
     }
   } catch (err: any) {
     if (err instanceof CapacityError) {
-      sendAnthropicError(res, 503, "api_error", err.message, {
-        "request-id": requestId,
-      });
+      sendAnthropicError(res, 503, "api_error", err.message);
     } else {
       log("ERROR", "Anthropic messages request failed", { error: err.message });
-      sendAnthropicError(res, 500, "api_error", err.message || "request failed", {
-        "request-id": requestId,
-      });
+      sendAnthropicError(res, 500, "api_error", err.message || "request failed");
     }
   } finally {
     if (closeAfterTurn && sessionId) sessions.close(sessionId);

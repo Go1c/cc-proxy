@@ -23,29 +23,9 @@ CLAUDE_CODE_OAUTH_TOKEN=<Claude Code OAuth token>
 CC_PROXY_API_KEY=<shared proxy API key>
 CLAUDE_COMMAND=/src/node_modules/@anthropic-ai/claude-code-linux-x64/claude
 CC_PERMISSION_MODE=acceptEdits
-CC_MESSAGES_BACKEND=claude-code
 ```
 
 `CC_PERMISSION_MODE=acceptEdits` is required when `/v1/messages` should allow Claude Code to create or edit files in the session workspace. Without it, read-only validation can still work, but write/edit requests may be denied or silently skipped by Claude Code permissions.
-
-`CC_MESSAGES_BACKEND` controls how `POST /v1/messages` is executed:
-
-```text
-claude-code  # default: run the request through Claude Code CLI and workspace hooks
-anthropic    # pass every /v1/messages request to the official Anthropic Messages API
-hybrid       # use Claude Code for text requests; use upstream for thinking, tools, images, and documents
-```
-
-For `anthropic` or `hybrid` upstream calls, configure:
-
-```text
-CC_ANTHROPIC_BASE_URL=https://api.anthropic.com
-CC_ANTHROPIC_API_KEY=<real Anthropic API key>
-CC_ANTHROPIC_AUTH_HEADER=x-api-key
-CC_ANTHROPIC_VERSION=2023-06-01
-```
-
-If `CC_ANTHROPIC_API_KEY` is not set, the proxy will use `CLAUDE_CODE_OAUTH_TOKEN` as an `Authorization: Bearer` upstream credential. If that credential is rejected by the upstream API, use a real Anthropic API key instead.
 
 ## How To Use
 
@@ -105,26 +85,6 @@ stream: true
 ```
 
 The proxy supports Anthropic-style Server-Sent Events for clients that require streaming. The underlying Claude Code turn is still executed as a real Claude Code request; the proxy currently sends the resulting assistant text as a buffered SSE response rather than token-by-token live streaming.
-
-### Full Messages API compatibility mode
-
-Use this mode for cctest-style protocol scoring where native thinking signatures, tool-use blocks, image input, document input, and exact upstream response shape matter:
-
-```text
-CC_MESSAGES_BACKEND=anthropic
-CC_ANTHROPIC_API_KEY=<real Anthropic API key>
-```
-
-In this mode `/v1/messages` is a real authenticated pass-through to the official Anthropic Messages API. Claude Code workspace hooks, `Read` interception, `Write`, and `x-cc-session-id` are not used for those requests.
-
-For mixed production use:
-
-```text
-CC_MESSAGES_BACKEND=hybrid
-CC_ANTHROPIC_API_KEY=<real Anthropic API key>
-```
-
-Hybrid mode keeps plain text requests on Claude Code, then routes requests containing `thinking`, client `tools`, `tool_choice`, `image`, or `document` blocks upstream so those features remain real instead of being serialized into text.
 
 ### Persistent cache sessions
 
@@ -187,10 +147,8 @@ Node HTTP server (dist/server.js)
   |
   +-- Anthropic compatibility adapter
   |     - validates /v1/messages JSON
-  |     - chooses claude-code, anthropic, or hybrid backend
-  |     - converts Claude Code requests into a Claude Code prompt
+  |     - converts messages into a Claude Code prompt
   |     - maps Claude Code result into Anthropic message JSON
-  |     - forwards upstream requests to the official Messages API unchanged
   |
   +-- SessionManager
         - creates and tracks Claude Code sessions
@@ -240,24 +198,20 @@ Node HTTP server (dist/server.js)
 - Optional Claude Code permission mode via `CC_PERMISSION_MODE`, including `acceptEdits` for write/edit validation.
 - Anthropic-style `POST /v1/messages`:
   - accepts `x-api-key` and `Authorization: Bearer`,
-  - returns Anthropic-style `request-id` headers for success and error responses,
   - returns `type: "message"`, assistant text content, stop reason and usage,
   - supports `stream: true` using Anthropic-style buffered SSE events,
   - returns cache and cost metadata from Claude Code in `usage`,
-  - supports temporary one-shot sessions and optional persistent sessions,
-  - can pass requests through to the official Anthropic Messages API with `CC_MESSAGES_BACKEND=anthropic`,
-  - can route native features upstream with `CC_MESSAGES_BACKEND=hybrid`.
+  - supports temporary one-shot sessions and optional persistent sessions.
 - Optional model override via `CC_CLAUDE_MODEL`.
 - Optional permission-mode override via `CC_PERMISSION_MODE`.
 
 ## Not Implemented Yet
 
 - Token-by-token live streaming is not implemented. `stream: true` clients receive Anthropic-style SSE events after the Claude Code turn completes.
-- Full Anthropic tool-use protocol is not implemented by the Claude Code backend. Use `CC_MESSAGES_BACKEND=anthropic` or `hybrid` for real upstream `tool_use` behavior.
-- Multimodal content is not natively handled by the Claude Code backend. Use `CC_MESSAGES_BACKEND=anthropic` or `hybrid` for real image/document input.
-- Native extended thinking signatures are not produced by the Claude Code backend. Use `CC_MESSAGES_BACKEND=anthropic` or `hybrid` for real upstream `thinking` blocks and signatures.
+- Full Anthropic tool-use protocol is not implemented. Client-supplied `tools` are included as prompt context, but the proxy does not return `tool_use` blocks or execute client function tools.
+- Multimodal content is not natively handled. Non-text content blocks are serialized into prompt text.
 - `/v1/messages` does not currently pass the request `model` field through to Claude Code. The response echoes the requested model for SDK compatibility; the actual Claude Code model is selected by Claude Code or `CC_CLAUDE_MODEL`.
-- Official Anthropic response headers and every edge-case error shape are fully preserved only in upstream `anthropic` mode.
+- Official Anthropic response headers and every edge-case error shape are not fully reproduced.
 - There is no rate limiting beyond `CC_MAX_SESSIONS`.
 - There is no per-user key management; `CC_PROXY_API_KEY` is a single shared proxy key.
 - The hook currently intercepts `Read`; writes happen in the Claude Code session workspace and are not mirrored back into `DOWNSTREAM_ROOT`.
