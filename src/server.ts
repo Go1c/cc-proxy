@@ -134,6 +134,10 @@ function sendJson(
   res.end(JSON.stringify(body));
 }
 
+function makeAnthropicRequestId(): string {
+  return `req_${randomUUID().replace(/-/g, "")}`;
+}
+
 function headerValue(req: http.IncomingMessage, name: string): string {
   const value = req.headers[name.toLowerCase()];
   if (Array.isArray(value)) return value[0] || "";
@@ -153,15 +157,22 @@ function sendAnthropicError(
   res: http.ServerResponse,
   status: number,
   type: string,
-  message: string
+  message: string,
+  requestId = makeAnthropicRequestId()
 ): void {
-  sendJson(res, status, { type: "error", error: { type, message } });
+  sendJson(
+    res,
+    status,
+    { type: "error", error: { type, message }, request_id: requestId },
+    { "request-id": requestId }
+  );
 }
 
 function requireClientAuth(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  responseShape: "anthropic" | "plain"
+  responseShape: "anthropic" | "plain",
+  requestId?: string
 ): boolean {
   if (!CLIENT_API_KEY) return true;
   if (extractClientApiKey(req) === CLIENT_API_KEY) return true;
@@ -171,7 +182,8 @@ function requireClientAuth(
       res,
       401,
       "authentication_error",
-      "Missing or invalid API key"
+      "Missing or invalid API key",
+      requestId
     );
   } else {
     sendJson(res, 401, { error: "unauthorized" });
@@ -245,8 +257,8 @@ function addContextToFirstUserMessage(
 }
 
 function buildTurnInputFromAnthropicMessages(body: any):
-  | { ok: true; messages: ClaudeStreamMessage[]; model: string }
-  | { ok: false; message: string } {
+  | { ok: true; messages: ClaudeStreamMessage[]; model: string; effort?: string }
+  | { ok: false; status?: number; type?: string; message: string } {
   if (!body || typeof body !== "object") {
     return { ok: false, message: "Request body must be a JSON object" };
   }
@@ -255,6 +267,16 @@ function buildTurnInputFromAnthropicMessages(body: any):
   }
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     return { ok: false, message: "Missing non-empty 'messages' array" };
+  }
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    return {
+      ok: false,
+      status: 501,
+      type: "not_supported_error",
+      message:
+        "client-supplied tools are not supported by this Claude Code proxy yet. " +
+        "Claude Code workspace tools still run normally, but per-request Anthropic function tools require a real tool_use/tool_result bridge.",
+    };
   }
 
   const contextParts: string[] = [];
@@ -271,19 +293,26 @@ function buildTurnInputFromAnthropicMessages(body: any):
     }
     messages.push(makeClaudeStreamMessage(message));
   }
-  if (Array.isArray(body.tools) && body.tools.length > 0) {
-    contextParts.push(
-      `[client_tools]\n${JSON.stringify(body.tools)}\n` +
-        "If a tool result is required, explain the requested tool call in text. " +
-        "This proxy executes Claude Code tools in the workspace, not client-supplied function tools."
-    );
-  }
 
   return {
     ok: true,
     messages: addContextToFirstUserMessage(messages, contextParts.join("\n\n")),
     model: body.model,
+    effort: thinkingToClaudeEffort(body.thinking),
   };
+}
+
+function thinkingToClaudeEffort(thinking: any): string | undefined {
+  if (!thinking || thinking.type === "disabled") return undefined;
+  if (thinking.type !== "enabled") return undefined;
+
+  const budget = Number(thinking.budget_tokens);
+  if (!Number.isFinite(budget) || budget <= 0) return "medium";
+  if (budget <= 4_096) return "low";
+  if (budget <= 16_000) return "medium";
+  if (budget <= 32_000) return "high";
+  if (budget <= 64_000) return "xhigh";
+  return "max";
 }
 
 function makeAnthropicMessage(model: string, result: any): any {
@@ -313,11 +342,11 @@ function sendSseEvent(res: http.ServerResponse, event: string, data: unknown): v
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
-function sendAnthropicStream(
+function writeAnthropicStreamHead(
   res: http.ServerResponse,
-  message: any,
   headers: Record<string, string>
 ): void {
+  if (res.headersSent) return;
   res.writeHead(200, {
     ...headers,
     "Content-Type": "text/event-stream; charset=utf-8",
@@ -325,7 +354,22 @@ function sendAnthropicStream(
     Connection: "keep-alive",
     "X-Accel-Buffering": "no",
   });
+}
 
+function sendAnthropicStream(
+  res: http.ServerResponse,
+  message: any,
+  headers: Record<string, string>
+): void {
+  writeAnthropicStreamHead(res, headers);
+  sendBufferedAnthropicStreamEvents(res, message);
+  res.end();
+}
+
+function sendBufferedAnthropicStreamEvents(
+  res: http.ServerResponse,
+  message: any
+): void {
   sendSseEvent(res, "message_start", {
     type: "message_start",
     message: {
@@ -357,7 +401,6 @@ function sendAnthropicStream(
     },
   });
   sendSseEvent(res, "message_stop", { type: "message_stop" });
-  res.end();
 }
 
 function sendSseContentBlock(
@@ -451,20 +494,27 @@ async function handleAnthropicMessages(
   req: http.IncomingMessage,
   res: http.ServerResponse
 ): Promise<void> {
-  if (!requireClientAuth(req, res, "anthropic")) return;
+  const requestId = makeAnthropicRequestId();
+  if (!requireClientAuth(req, res, "anthropic", requestId)) return;
 
   const bodyText = await readBody(req);
   let body: any;
   try {
     body = JSON.parse(bodyText);
   } catch {
-    sendAnthropicError(res, 400, "invalid_request_error", "Invalid JSON body");
+    sendAnthropicError(res, 400, "invalid_request_error", "Invalid JSON body", requestId);
     return;
   }
 
   const turnInputResult = buildTurnInputFromAnthropicMessages(body);
   if (!turnInputResult.ok) {
-    sendAnthropicError(res, 400, "invalid_request_error", turnInputResult.message);
+    sendAnthropicError(
+      res,
+      turnInputResult.status || 400,
+      turnInputResult.type || "invalid_request_error",
+      turnInputResult.message,
+      requestId
+    );
     return;
   }
 
@@ -480,39 +530,88 @@ async function handleAnthropicMessages(
           res,
           404,
           "invalid_request_error",
-          `Unknown x-cc-session-id: ${sessionId}`
+          `Unknown x-cc-session-id: ${sessionId}`,
+          requestId
         );
         return;
       }
     } else {
-      const info = sessions.create();
+      const info = sessions.create({
+        model: turnInputResult.model,
+        effort: turnInputResult.effort,
+      });
       sessionId = info.id;
       closeAfterTurn = !keepSession;
     }
 
-    const result = await sessions.turn(sessionId, turnInputResult.messages);
+    const responseHeaders: Record<string, string> = { "request-id": requestId };
+    if (!closeAfterTurn) responseHeaders["x-cc-session-id"] = sessionId;
+
+    let streamedLiveEvents = false;
+    const result = await sessions.turn(
+      sessionId,
+      turnInputResult.messages,
+      body.stream === true
+        ? {
+            onStreamEvent: (event, raw) => {
+              streamedLiveEvents = true;
+              if (raw?.session_id) {
+                responseHeaders["x-cc-cli-session-id"] = raw.session_id;
+              }
+              writeAnthropicStreamHead(res, responseHeaders);
+              sendSseEvent(res, event.type || "message", event);
+            },
+          }
+        : {}
+    );
+    responseHeaders["x-cc-cli-session-id"] = result.session_id;
     if (result.is_error) {
-      sendAnthropicError(res, 502, "api_error", result.result || "Claude Code turn failed");
+      if (res.headersSent) {
+        sendSseEvent(res, "error", {
+          type: "error",
+          error: {
+            type: "api_error",
+            message: result.result || "Claude Code turn failed",
+          },
+        });
+        res.end();
+      } else {
+        sendAnthropicError(
+          res,
+          502,
+          "api_error",
+          result.result || "Claude Code turn failed",
+          requestId
+        );
+      }
       return;
     }
 
-    const responseHeaders: Record<string, string> = {
-      "x-cc-cli-session-id": result.session_id,
-    };
-    if (!closeAfterTurn) responseHeaders["x-cc-session-id"] = sessionId;
-
     const message = makeAnthropicMessage(turnInputResult.model, result);
     if (body.stream === true) {
-      sendAnthropicStream(res, message, responseHeaders);
+      writeAnthropicStreamHead(res, responseHeaders);
+      if (!streamedLiveEvents) {
+        sendBufferedAnthropicStreamEvents(res, message);
+      }
+      res.end();
     } else {
       sendJson(res, 200, message, responseHeaders);
     }
   } catch (err: any) {
     if (err instanceof CapacityError) {
-      sendAnthropicError(res, 503, "api_error", err.message);
+      sendAnthropicError(res, 503, "api_error", err.message, requestId);
+    } else if (res.headersSent) {
+      log("ERROR", "Anthropic messages request failed after stream started", {
+        error: err.message,
+      });
+      sendSseEvent(res, "error", {
+        type: "error",
+        error: { type: "api_error", message: err.message || "request failed" },
+      });
+      res.end();
     } else {
       log("ERROR", "Anthropic messages request failed", { error: err.message });
-      sendAnthropicError(res, 500, "api_error", err.message || "request failed");
+      sendAnthropicError(res, 500, "api_error", err.message || "request failed", requestId);
     }
   } finally {
     if (closeAfterTurn && sessionId) sessions.close(sessionId);

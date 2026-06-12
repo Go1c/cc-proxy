@@ -31,6 +31,106 @@ CC_MAX_SESSIONS=10
 
 Do not configure `CC_ANTHROPIC_API_KEY`, `CC_ANTHROPIC_BASE_URL`, `CC_ANTHROPIC_AUTH_HEADER`, `CC_ANTHROPIC_BETA`, or `CC_ANTHROPIC_VERSION` for this deployment. The goal is to use Claude Code OAuth/subscription quota through the real Claude Code CLI, not Anthropic API usage credits.
 
+## Zeabur Claude Code OAuth Flow
+
+The OAuth login must be initiated from the server or Pod that will run Claude Code. A browser success page only proves the browser side succeeded; the CLI must receive the returned `code#state` and save credentials in the same runtime context.
+
+Fast path for the current Zeabur node:
+
+```bash
+ssh ubuntu@43.128.89.221
+
+NS=environment-6a2ad5e305a35017ba9066bb
+DEPLOY=service-6a2ad5ee16481d6693b3f1f5
+POD=$(sudo kubectl get pods -n "$NS" -o name | sed -n 's#pod/##p' | head -n 1)
+
+sudo kubectl exec -it -n "$NS" "$POD" -- sh -lc '
+  rm -rf /tmp/cc-oauth
+  mkdir -p /tmp/cc-oauth
+  chmod 700 /tmp/cc-oauth
+  HOME=/tmp/cc-oauth \
+    env -u CLAUDE_CODE_OAUTH_TOKEN \
+        -u ANTHROPIC_BASE_URL \
+        -u ANTHROPIC_AUTH_TOKEN \
+        -u ANTHROPIC_API_KEY \
+        -u ANTHROPIC_AUTH_HEADER \
+    /src/node_modules/@anthropic-ai/claude-code-linux-x64/claude auth login --claudeai
+'
+```
+
+Open the printed `https://claude.com/cai/oauth/authorize?...` URL in a local browser. If the browser shows a `code#state` value, paste it back into the waiting server terminal. After login succeeds, confirm the Pod account is using Claude subscription auth:
+
+```bash
+sudo kubectl exec -n "$NS" "$POD" -- sh -lc '
+  HOME=/tmp/cc-oauth \
+    env -u CLAUDE_CODE_OAUTH_TOKEN \
+        -u ANTHROPIC_BASE_URL \
+        -u ANTHROPIC_AUTH_TOKEN \
+        -u ANTHROPIC_API_KEY \
+        -u ANTHROPIC_AUTH_HEADER \
+    /src/node_modules/@anthropic-ai/claude-code-linux-x64/claude auth status --json
+'
+```
+
+Expected shape:
+
+```json
+{
+  "loggedIn": true,
+  "authMethod": "claude.ai",
+  "apiProvider": "firstParty",
+  "subscriptionType": "pro"
+}
+```
+
+Then generate the long-lived token:
+
+```bash
+sudo kubectl exec -it -n "$NS" "$POD" -- sh -lc '
+  HOME=/tmp/cc-oauth \
+    env -u CLAUDE_CODE_OAUTH_TOKEN \
+        -u ANTHROPIC_BASE_URL \
+        -u ANTHROPIC_AUTH_TOKEN \
+        -u ANTHROPIC_API_KEY \
+        -u ANTHROPIC_AUTH_HEADER \
+    /src/node_modules/@anthropic-ai/claude-code-linux-x64/claude setup-token
+'
+```
+
+`setup-token` may print a second browser OAuth URL. Complete that authorization too. The value to keep is the final long-lived token printed by `setup-token`, not the short `code#state` browser callback value.
+
+To make the token survive Zeabur rebuilds/redeploys, configure it in Zeabur service variables:
+
+```text
+CLAUDE_CODE_OAUTH_TOKEN=<long-lived token from claude setup-token>
+```
+
+Also keep these service variables in Zeabur:
+
+```text
+CLAUDE_COMMAND=/src/node_modules/@anthropic-ai/claude-code-linux-x64/claude
+CC_CLAUDE_MODEL=claude-sonnet-4-6
+CC_PERMISSION_MODE=acceptEdits
+CC_MAX_SESSIONS=10
+CC_PROXY_API_KEY=<shared proxy API key>
+```
+
+Do not put browser `code#state` values into Zeabur variables. They are one-time OAuth callback codes, not runtime credentials.
+
+For a one-off live Kubernetes patch after setting the Zeabur variable:
+
+```bash
+sudo kubectl set env -n "$NS" deploy/"$DEPLOY" \
+  CLAUDE_CODE_OAUTH_TOKEN='<long-lived token>' \
+  CLAUDE_COMMAND=/src/node_modules/@anthropic-ai/claude-code-linux-x64/claude \
+  CC_CLAUDE_MODEL=claude-sonnet-4-6 \
+  CC_PERMISSION_MODE=acceptEdits \
+  CC_MAX_SESSIONS=10 \
+  CC_ANTHROPIC_BETA- CC_ANTHROPIC_BASE_URL- CC_ANTHROPIC_API_KEY- CC_ANTHROPIC_AUTH_HEADER- CC_ANTHROPIC_VERSION-
+
+sudo kubectl rollout status -n "$NS" deploy/"$DEPLOY" --timeout=180s
+```
+
 Current Zeabur runtime patch:
 
 ```text
@@ -96,7 +196,37 @@ Streaming clients:
 stream: true
 ```
 
-The proxy supports Anthropic-style Server-Sent Events for clients that require streaming. The underlying Claude Code turn is still executed as a real Claude Code request; the proxy currently sends buffered SSE events after the Claude Code turn completes rather than token-by-token live streaming.
+The proxy supports Anthropic-style Server-Sent Events for clients that require streaming. For real Claude Code partial output, the runner starts Claude Code with `--include-partial-messages` and forwards Claude Code `stream_event` objects as SSE events as soon as they arrive. If a Claude Code version does not emit partial events for a turn, the proxy falls back to buffered Anthropic-style SSE events after the turn completes.
+
+Client-supplied Anthropic function tools:
+
+```json
+{
+  "tools": [{ "name": "example_tool", "input_schema": { "type": "object" } }]
+}
+```
+
+These are intentionally rejected with `501 not_supported_error`. This avoids fake prompt-emulated tool support. Claude Code's own workspace tools still run normally inside the CLI session, but the Anthropic client-tool protocol needs a real multi-turn `tool_use` / `tool_result` bridge before it can be marked compatible.
+
+Thinking requests:
+
+```json
+{
+  "thinking": { "type": "enabled", "budget_tokens": 32000 }
+}
+```
+
+For new `/v1/messages` sessions, `thinking.budget_tokens` is mapped approximately to Claude Code `--effort`: `low`, `medium`, `high`, `xhigh`, or `max`. This is not the same as Anthropic's exact thinking-token budget API; it is the closest stable Claude Code CLI control exposed here.
+
+Request `model`:
+
+```json
+{
+  "model": "claude-sonnet-4-6"
+}
+```
+
+For new `/v1/messages` sessions, the request `model` is passed to Claude Code as `--model`. Existing persistent sessions cannot change model or effort mid-process; create a new proxy session when changing either value.
 
 ### Persistent cache sessions
 
@@ -161,6 +291,7 @@ Node HTTP server (dist/server.js)
   |     - validates /v1/messages JSON
   |     - converts user/assistant messages into Claude Code stream-json events
   |     - preserves native content blocks where Claude Code supports them
+  |     - forwards Claude Code partial stream_event objects as Anthropic SSE
   |     - maps Claude Code assistant/result events into Anthropic message JSON
   |
   +-- SessionManager
@@ -173,7 +304,7 @@ Node HTTP server (dist/server.js)
       ClaudeRunner
         - starts bundled @anthropic-ai/claude-code native binary
         - sends stream-json user/assistant turns
-        - parses assistant content blocks, result, usage, cache and cost metadata
+        - parses stream_event, assistant content blocks, result, usage, cache and cost metadata
         |
         v
       Claude Code CLI in /src/test-workspace
@@ -211,11 +342,15 @@ Node HTTP server (dist/server.js)
 - Optional Claude Code permission mode via `CC_PERMISSION_MODE`, including `acceptEdits` for write/edit validation.
 - Anthropic-style `POST /v1/messages`:
   - accepts `x-api-key` and `Authorization: Bearer`,
+  - emits `request-id` response headers and `request_id` on Anthropic-shaped errors,
   - returns `type: "message"`, assistant content blocks, stop reason and usage,
-  - supports `stream: true` using Anthropic-style buffered SSE events,
+  - supports `stream: true` using live Claude Code partial `stream_event` forwarding, with buffered SSE fallback,
   - passes supported content blocks to Claude Code as native stream-json blocks, including text, image, document, tool_result, and assistant history blocks,
   - preserves Claude Code assistant blocks such as `thinking` with `signature` when Claude Code emits them,
   - returns cache and cost metadata from Claude Code in `usage`,
+  - maps request `model` to Claude Code `--model` for new sessions,
+  - maps request `thinking.budget_tokens` approximately to Claude Code `--effort` for new sessions,
+  - rejects client-supplied Anthropic `tools` with `501 not_supported_error` instead of prompt-emulating them,
   - supports temporary one-shot sessions and optional persistent sessions.
 - Optional model override via `CC_CLAUDE_MODEL`.
 - Optional permission-mode override via `CC_PERMISSION_MODE`.
@@ -226,43 +361,44 @@ Node HTTP server (dist/server.js)
 - Reverted the Anthropic API upstream backend so requests no longer use API credits.
 - Restored `/v1/messages` to route through the real Claude Code CLI using OAuth/subscription quota.
 - Added Anthropic-compatible `POST /v1/messages` auth through `x-api-key` and `Authorization: Bearer`.
-- Added buffered `stream: true` SSE compatibility.
+- Added `request-id` headers and Anthropic-shaped `request_id` error bodies.
+- Added live `stream: true` SSE forwarding from Claude Code partial `stream_event` output.
 - Preserved Claude Code stream-json assistant blocks, including `thinking` and `signature`.
 - Preserved native input blocks passed to Claude Code, including text, image, document, tool_result, and assistant history blocks.
+- Passed `/v1/messages` request `model` through to Claude Code `--model` for new sessions.
+- Mapped `/v1/messages` `thinking.budget_tokens` to Claude Code `--effort` for new sessions.
+- Replaced prompt-emulated client-supplied `tools` with explicit `501 not_supported_error`.
 - Added `CC_CLAUDE_MODEL=claude-sonnet-4-6` CLI model override.
 - Added `CC_PERMISSION_MODE=acceptEdits` CLI permission override.
 - Set production `CC_MAX_SESSIONS=10`.
 - Removed production `CC_ANTHROPIC_*` environment variables.
 - Fixed the Zeabur deployment mismatch where only `server.js` was mounted and the old image `runner.js` was still used.
+- Added local fake-Claude coverage for live stream chunks, multimodal native blocks, assistant history preservation, request model/effort args, cache metadata, request-id headers, and tool edge cases.
 - Verified production text, stream, image, long-context game-development prompts, Read hook markers, persistent sessions, and cache metadata.
 
 ## Not Implemented Yet
 
-- Token-by-token live streaming is not implemented. `stream: true` clients receive Anthropic-style SSE events after the Claude Code turn completes.
-- Full client-supplied Anthropic tool-use protocol is not implemented. Client-supplied `tools` are included as prompt context, but the proxy does not dynamically register or execute those client function tools.
-- `thinking` request options are not translated into a per-request Claude Code effort setting yet. The proxy preserves `thinking` blocks and signatures when Claude Code emits them.
-- `/v1/messages` does not currently pass the request `model` field through to Claude Code. The response echoes the requested model for SDK compatibility; the actual Claude Code model is selected by Claude Code or `CC_CLAUDE_MODEL`.
-- Official Anthropic response headers and every edge-case error shape are not fully reproduced.
+- Full client-supplied Anthropic tool-use protocol is not implemented. Client-supplied `tools` are rejected with `501 not_supported_error`; they are not prompt-emulated.
+- `thinking.budget_tokens` uses an approximate Claude Code `--effort` mapping, not exact Anthropic thinking-token budget semantics.
+- Existing persistent sessions cannot change model or effort after the Claude Code process starts.
+- Official Anthropic response headers and every edge-case error shape are not fully reproduced beyond the implemented `request-id` and `request_id` fields.
 - There is no rate limiting beyond `CC_MAX_SESSIONS`.
 - There is no per-user key management; `CC_PROXY_API_KEY` is a single shared proxy key.
 - The hook currently intercepts `Read`; writes happen in the Claude Code session workspace and are not mirrored back into `DOWNSTREAM_ROOT`.
 
 ## TODO
 
-- Implement live token-by-token streaming from Claude Code events instead of buffered SSE.
 - Implement real client-supplied Anthropic tool protocol support:
   - accept `tools`,
   - emit `tool_use`,
   - accept follow-up `tool_result`,
   - preserve `tool_choice` semantics where possible.
-- Map Anthropic `thinking` request options to an appropriate Claude Code effort/config path if Claude Code exposes a stable interface.
-- Decide whether per-request `model` should override the CLI model or remain deployment-controlled by `CC_CLAUDE_MODEL`.
-- Improve Anthropic-compatible response headers and error shapes, including request IDs.
+- Improve Anthropic-compatible response headers and edge-case error shapes beyond request IDs.
 - Add per-user or per-client API keys instead of one shared `CC_PROXY_API_KEY`.
 - Add explicit production rate limiting beyond `CC_MAX_SESSIONS`.
 - Decide how write/edit results should sync back to a real downstream workspace in a remote-agent architecture.
 - Add a repeatable production deployment script for the `cc-proxy-dist` ConfigMap patch.
-- Add cctest coverage for long context, streaming, multimodal images, assistant history, cache reuse, and tool-call edge cases.
+- Add live production integration coverage for request-id headers, live streaming timing, model/effort args, and unsupported `tools` 501 behavior.
 
 ## Known Edge Cases
 
@@ -328,6 +464,10 @@ Production status:
 
 ```text
 GET /health -> 200, max_sessions=10
+POST /v1/messages invalid messages -> 400, request-id header matches body request_id
+POST /v1/messages client-supplied tools -> 501, not_supported_error
+POST /v1/messages text -> 200, request-id and x-cc-cli-session-id present, DEPLOY_NORMAL_OK present
+POST /v1/messages stream:true game-development prompt -> 200, text/event-stream, request-id and x-cc-cli-session-id present, content_block_delta present, STREAM_LIVE_DEPLOY_OK present
 POST /v1/messages text Read hook -> 200, marker ALPHA-BRAVO-CHARLIE-7742 present
 POST /v1/messages stream:true -> 200, Anthropic SSE events present, STREAM_COMPAT_OK present
 POST /v1/messages image 64x64 PNG -> 200, Red
@@ -340,6 +480,14 @@ Local non-paid test suite:
 
 ```bash
 npm test
+```
+
+Latest local result:
+
+```text
+tests 69
+pass 69
+fail 0
 ```
 
 Real paid integration test:

@@ -92,6 +92,60 @@ function httpPost(
   });
 }
 
+function httpPostChunked(
+  url: string,
+  body: unknown,
+  headers: Record<string, string> = {}
+): Promise<{
+  status: number;
+  body: string;
+  headers: http.IncomingHttpHeaders;
+  chunks: Array<{ atMs: number; text: string }>;
+}> {
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const data = JSON.stringify(body);
+    const urlObj = new URL(url);
+    const options = {
+      hostname: urlObj.hostname,
+      port: urlObj.port,
+      path: urlObj.pathname,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(data),
+        ...headers,
+      },
+    };
+    const chunks: Array<{ atMs: number; text: string }> = [];
+    const req = http.request(options, (res) => {
+      const bodyChunks: Buffer[] = [];
+      res.on("data", (c: Buffer) => {
+        const text = c.toString("utf-8");
+        chunks.push({ atMs: Date.now() - startedAt, text });
+        bodyChunks.push(c);
+      });
+      res.on("end", () => {
+        resolve({
+          status: res.statusCode || 0,
+          body: Buffer.concat(bodyChunks).toString("utf-8"),
+          headers: res.headers,
+          chunks,
+        });
+      });
+    });
+    req.on("error", (err) =>
+      resolve({ status: 0, body: err.message, headers: {}, chunks })
+    );
+    req.setTimeout(5000, () => {
+      req.destroy();
+      resolve({ status: 0, body: "timeout", headers: {}, chunks });
+    });
+    req.write(data);
+    req.end();
+  });
+}
+
 function httpDelete(
   url: string,
   headers: Record<string, string> = {}
@@ -206,6 +260,147 @@ process.stdin.on("data", (chunk) => {
       is_error: false
     }) + "\\n");
   }
+});
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
+function writeStreamingClaudeCommand(delayMs = 1400): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `streaming-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let emitted = false;
+function emit(obj) {
+  process.stdout.write(JSON.stringify(obj) + "\\n");
+}
+process.stdin.on("data", (chunk) => {
+  if (emitted) return;
+  if (!chunk.trim()) return;
+  emitted = true;
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "message_start",
+      message: {
+        id: "msg_live_fake",
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 1, output_tokens: 0 }
+      }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "LIVE_DELTA_BEFORE_RESULT" }
+    }
+  });
+  setTimeout(() => {
+    emit({
+      type: "assistant",
+      session_id: "fake-cli-session",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "LIVE_DELTA_BEFORE_RESULT" }]
+      }
+    });
+    emit({
+      type: "stream_event",
+      session_id: "fake-cli-session",
+      event: { type: "content_block_stop", index: 0 }
+    });
+    emit({
+      type: "stream_event",
+      session_id: "fake-cli-session",
+      event: {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn", stop_sequence: null },
+        usage: { output_tokens: 4 }
+      }
+    });
+    emit({
+      type: "stream_event",
+      session_id: "fake-cli-session",
+      event: { type: "message_stop" }
+    });
+    emit({
+      type: "result",
+      session_id: "fake-cli-session",
+      result: "LIVE_DELTA_BEFORE_RESULT",
+      usage: {
+        input_tokens: 1,
+        output_tokens: 4,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0
+      },
+      total_cost_usd: 0,
+      duration_ms: ${delayMs},
+      num_turns: 1,
+      is_error: false,
+      stop_reason: "end_turn"
+    });
+  }, ${delayMs});
+});
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
+function writeArgvClaudeCommand(): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `argv-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let done = false;
+process.stdin.on("data", (chunk) => {
+  if (done || !chunk.trim()) return;
+  done = true;
+  const result = "ARGV:" + process.argv.slice(2).join(" ");
+  process.stdout.write(JSON.stringify({
+    type: "assistant",
+    session_id: "fake-cli-session",
+    message: { role: "assistant", content: [{ type: "text", text: result }] }
+  }) + "\\n");
+  process.stdout.write(JSON.stringify({
+    type: "result",
+    session_id: "fake-cli-session",
+    result,
+    usage: {
+      input_tokens: 1,
+      output_tokens: 1,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0
+    },
+    total_cost_usd: 0,
+    duration_ms: 1,
+    num_turns: 1,
+    is_error: false
+  }) + "\\n");
 });
 `,
     "utf-8"
@@ -379,6 +574,14 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       }
     });
 
+    it("enables Claude Code partial stream-json messages for live SSE", () => {
+      const args = resolveClaudeArgs();
+      assert.ok(
+        args.includes("--include-partial-messages"),
+        "Claude CLI args should request partial stream events"
+      );
+    });
+
     it("GET /health returns 200 with status ok", async () => {
       const res = await httpGet(`${BASE_URL}/health`);
       assert.equal(res.status, 200);
@@ -481,6 +684,54 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       }
     });
 
+    it("returns request-id header and request_id on Anthropic errors", async () => {
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          { model: "claude-sonnet-4-6", max_tokens: 128, messages: [] },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 400);
+        const requestId = String(res.headers["request-id"] || "");
+        assert.match(requestId, /^req_/);
+        const body = JSON.parse(res.body);
+        assert.equal(body.type, "error");
+        assert.equal(body.request_id, requestId);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+      }
+    });
+
+    it("returns request-id header on successful Anthropic messages responses", async () => {
+      const fakeClaude = writeFakeClaudeCommand("REQUEST_ID_OK");
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            messages: [{ role: "user", content: "hello" }],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200);
+        assert.match(String(res.headers["request-id"] || ""), /^req_/);
+        assert.match(res.body, /REQUEST_ID_OK/);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
     it("returns Anthropic SSE events for stream:true /v1/messages requests", async () => {
       const fakeClaude = writeFakeClaudeCommand("FAKE_STREAM_RESULT");
       const proc = await startTestServer(ANTHROPIC_PORT, {
@@ -506,6 +757,106 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.match(res.body, /event: message_stop/);
         assert.match(res.body, /FAKE_STREAM_RESULT/);
         assert.match(res.body, /"total_cost_usd":0.0123/);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("forwards Claude Code stream_event chunks before the turn result completes", async () => {
+      const fakeClaude = writeStreamingClaudeCommand(1400);
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPostChunked(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            stream: true,
+            messages: [{ role: "user", content: "hello" }],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200);
+        assert.match(String(res.headers["content-type"]), /^text\/event-stream/);
+        assert.equal(res.headers["x-cc-cli-session-id"], "fake-cli-session");
+        assert.match(res.body, /LIVE_DELTA_BEFORE_RESULT/);
+        assert.ok(res.chunks.length > 0, "stream should produce chunks");
+        assert.ok(
+          res.chunks[0].atMs < 1000,
+          `first SSE chunk should arrive before delayed result, got ${res.chunks[0].atMs}ms`
+        );
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("rejects client-supplied Anthropic tools instead of prompt-emulating them", async () => {
+      const fakeClaude = writeFakeClaudeCommand("SHOULD_NOT_RUN");
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            tools: [
+              {
+                name: "lookup_frame_budget",
+                description: "Look up a game frame budget.",
+                input_schema: {
+                  type: "object",
+                  properties: { platform: { type: "string" } },
+                },
+              },
+            ],
+            messages: [{ role: "user", content: "Use the tool." }],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 501);
+        const body = JSON.parse(res.body);
+        assert.equal(body.type, "error");
+        assert.equal(body.error.type, "not_supported_error");
+        assert.match(body.error.message, /client-supplied tools/i);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("maps /v1/messages model and thinking budget to Claude Code CLI args for new sessions", async () => {
+      const fakeClaude = writeArgvClaudeCommand();
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-request-model",
+            max_tokens: 128,
+            thinking: { type: "enabled", budget_tokens: 32000 },
+            messages: [{ role: "user", content: "hello" }],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200);
+        const body = JSON.parse(res.body);
+        const text = body.content?.[0]?.text || "";
+        assert.match(text, /--model claude-request-model/);
+        assert.match(text, /--effort high/);
       } finally {
         proc.kill("SIGKILL");
         await sleep(300);

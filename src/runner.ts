@@ -21,6 +21,17 @@ interface PendingTurn {
   timer: NodeJS.Timeout;
   thinkingBlocks: ClaudeContentBlock[];
   lastAssistantContent: ClaudeContentBlock[];
+  onStreamEvent?: (event: any, raw: any) => void;
+}
+
+export interface ClaudeRunnerOptions {
+  model?: string;
+  permissionMode?: string;
+  effort?: string;
+}
+
+export interface TurnCallbacks {
+  onStreamEvent?: (event: any, raw: any) => void;
 }
 
 export function resolveClaudeCommand(): string {
@@ -60,20 +71,27 @@ export function resolveClaudeCommand(): string {
   return "claude";
 }
 
-export function resolveClaudeArgs(): string[] {
+export function resolveClaudeArgs(options: ClaudeRunnerOptions = {}): string[] {
   const args = [
     "-p",
     "--input-format",
     "stream-json",
     "--output-format",
     "stream-json",
+    "--include-partial-messages",
     "--verbose",
   ];
-  if (process.env.CC_CLAUDE_MODEL) {
-    args.push("--model", process.env.CC_CLAUDE_MODEL);
+  const model = options.model || process.env.CC_CLAUDE_MODEL;
+  if (model) {
+    args.push("--model", model);
   }
-  if (process.env.CC_PERMISSION_MODE) {
-    args.push("--permission-mode", process.env.CC_PERMISSION_MODE);
+  const permissionMode = options.permissionMode || process.env.CC_PERMISSION_MODE;
+  if (permissionMode) {
+    args.push("--permission-mode", permissionMode);
+  }
+  const effort = options.effort || process.env.CC_CLAUDE_EFFORT;
+  if (effort) {
+    args.push("--effort", effort);
   }
   return args;
 }
@@ -89,7 +107,10 @@ export class ClaudeRunner extends EventEmitter {
   private cliSessionId: string | null = null;
   private closed = false;
 
-  constructor(private readonly cwd: string) {
+  constructor(
+    private readonly cwd: string,
+    private readonly options: ClaudeRunnerOptions = {}
+  ) {
     super();
   }
 
@@ -97,7 +118,7 @@ export class ClaudeRunner extends EventEmitter {
     if (this.proc) return;
     this.proc = spawn(
       resolveClaudeCommand(),
-      resolveClaudeArgs(),
+      resolveClaudeArgs(this.options),
       { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"] }
     );
 
@@ -118,7 +139,11 @@ export class ClaudeRunner extends EventEmitter {
   }
 
   /** Send one turn; resolves with the result for that turn. */
-  send(input: ClaudeTurnInput, timeoutMs = DEFAULT_TURN_TIMEOUT_MS): Promise<TurnResult> {
+  send(
+    input: ClaudeTurnInput,
+    timeoutMs = DEFAULT_TURN_TIMEOUT_MS,
+    callbacks: TurnCallbacks = {}
+  ): Promise<TurnResult> {
     if (!this.proc || this.closed) {
       return Promise.reject(new Error("runner not running"));
     }
@@ -140,6 +165,7 @@ export class ClaudeRunner extends EventEmitter {
         timer,
         thinkingBlocks: [],
         lastAssistantContent: [],
+        onStreamEvent: callbacks.onStreamEvent,
       };
 
       for (const msg of messages) {
@@ -186,6 +212,9 @@ export class ClaudeRunner extends EventEmitter {
     }
     if (obj.session_id && !this.cliSessionId) {
       this.cliSessionId = obj.session_id;
+    }
+    if (obj.type === "stream_event" && obj.event) {
+      this.pending?.onStreamEvent?.(obj.event, obj);
     }
     if (obj.type === "assistant") {
       this.onAssistant(obj);

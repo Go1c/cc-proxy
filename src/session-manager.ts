@@ -1,5 +1,5 @@
 import { randomUUID } from "crypto";
-import { ClaudeRunner } from "./runner";
+import { ClaudeRunner, ClaudeRunnerOptions, TurnCallbacks } from "./runner";
 import { ClaudeTurnInput, SessionInfo, SessionState, TurnResult } from "./types";
 
 const MAX_SESSIONS = parseInt(process.env.CC_MAX_SESSIONS || "10", 10);
@@ -28,6 +28,8 @@ interface Session {
   turns: number;
 }
 
+type SessionOptions = ClaudeRunnerOptions;
+
 export class SessionManager {
   private sessions = new Map<string, Session>();
   private reaper: NodeJS.Timeout;
@@ -41,12 +43,12 @@ export class SessionManager {
     return this.sessions.size;
   }
 
-  create(): SessionInfo {
+  create(options: SessionOptions = {}): SessionInfo {
     if (this.sessions.size >= MAX_SESSIONS) {
       throw new CapacityError(MAX_SESSIONS);
     }
     const id = randomUUID();
-    const runner = new ClaudeRunner(this.cwd);
+    const runner = new ClaudeRunner(this.cwd, options);
     const now = Date.now();
     const session: Session = {
       id,
@@ -69,7 +71,11 @@ export class SessionManager {
     return this.toInfo(session);
   }
 
-  async turn(id: string, input: ClaudeTurnInput): Promise<TurnResult> {
+  async turn(
+    id: string,
+    input: ClaudeTurnInput,
+    callbacks: TurnCallbacks = {}
+  ): Promise<TurnResult> {
     const session = this.sessions.get(id);
     if (!session) throw new Error("session not found");
     if (!session.runner.isAlive) throw new Error("session not alive");
@@ -79,7 +85,7 @@ export class SessionManager {
     session.state = "running";
     session.lastActiveAt = Date.now();
     try {
-      const result = await session.runner.send(input);
+      const result = await session.runner.send(input, undefined, callbacks);
       session.turns++;
       return result;
     } finally {
