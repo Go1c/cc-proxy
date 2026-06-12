@@ -514,6 +514,23 @@ if (process.stdout.isTTY) {
   return scriptPath;
 }
 
+function writeAnsiClaudeAuthCommand(argsPath: string): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `ansi-auth-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+const fs = require("fs");
+fs.writeFileSync(${JSON.stringify(argsPath)}, JSON.stringify(process.argv.slice(2)), "utf8");
+process.stdout.write("\\x1b[38;5;246mOpen https://claude.example/oauth?code_challenge=abc123&state=xyz\\x1b[39m\\r\\n");
+process.stdout.write("\\x1b[2GPaste\\x1b[8Gcode\\x1b[13Ghere >\\r\\n");
+setTimeout(() => process.exit(0), 50);
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
 function writeInteractiveClaudeAuthCommand(resultPath: string): string {
   const scriptPath = path.join(TEST_WORKSPACE, `interactive-auth-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
   fs.writeFileSync(
@@ -1594,6 +1611,61 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         const recorded = JSON.parse(fs.readFileSync(argsPath, "utf-8"));
         assert.deepEqual(recorded.args, ["setup-token"]);
         assert.equal(recorded.stdoutIsTTY, true);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("returns a clean Claude auth display log and OAuth URL for the admin UI", async () => {
+      const dataDir = makeIsolatedDataDir("admin-claude-auth-clean-display");
+      const argsPath = path.join(dataDir, "claude-auth-ansi-args.json");
+      const fakeClaude = writeAnsiClaudeAuthCommand(argsPath);
+      const proc = await startTestServer(ZEABUR_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const baseUrl = `http://localhost:${ZEABUR_PORT}`;
+        const adminToken = await bootstrapAdmin(baseUrl);
+
+        const updated = await httpPut(
+          `${baseUrl}/admin/config`,
+          {
+            claude_command: fakeClaude,
+            claude_auth_login_args: "setup-token",
+          },
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(updated.status, 200, updated.body);
+
+        const started = await httpPost(
+          `${baseUrl}/admin/claude-auth/login`,
+          {},
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(started.status, 202, started.body);
+
+        let authBody: any = null;
+        for (let i = 0; i < 20; i++) {
+          const auth = await httpGet(`${baseUrl}/admin/claude-auth`, {
+            Authorization: `Bearer ${adminToken}`,
+          });
+          assert.equal(auth.status, 200, auth.body);
+          authBody = JSON.parse(auth.body);
+          if (authBody.auth.status === "succeeded") break;
+          await sleep(50);
+        }
+
+        assert.equal(authBody.auth.status, "succeeded");
+        assert.match(authBody.auth.log, /\x1b\[/);
+        assert.equal(
+          authBody.view.auth_url,
+          "https://claude.example/oauth?code_challenge=abc123&state=xyz"
+        );
+        assert.match(authBody.view.display_log, /Open https:\/\/claude\.example\/oauth/);
+        assert.doesNotMatch(authBody.view.display_log, /\x1b\[/);
       } finally {
         proc.kill("SIGKILL");
         await sleep(300);

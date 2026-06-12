@@ -978,7 +978,7 @@
     }
 
     async function loadClaudeAuth() {
-      const { auth } = await api("/admin/claude-auth");
+      const { auth, view = {} } = await api("/admin/claude-auth");
       const status = auth.status || "idle";
       $("claudeAuthStatus").textContent = status;
       $("claudeAuthStatus").className = `status ${statusClass(status)}`;
@@ -994,8 +994,9 @@
         auth.exit_code == null ? "" : `exit: ${auth.exit_code}`,
         auth.log || "",
       ].filter(Boolean).join("\n");
-      $("claudeAuthLog").textContent = logText || "认证日志会显示在这里";
-      renderClaudeAuthLink(logText);
+      const displayLog = view.display_log || stripAnsi(logText);
+      $("claudeAuthLog").textContent = displayLog || "认证日志会显示在这里";
+      renderClaudeAuthLink(view.auth_url || extractFirstUrl(displayLog));
       if (status === "running") startAuthPolling();
       else stopAuthPolling();
     }
@@ -1039,17 +1040,17 @@
       refreshTimer = null;
     }
 
-    function renderClaudeAuthLink(logText) {
+    function renderClaudeAuthLink(url) {
       const link = $("claudeAuthLink");
-      const match = String(logText || "").match(/https?:\/\/[^\s"'<>]+/);
-      if (!match) {
+      const safeUrl = String(url || "").trim();
+      if (!safeUrl) {
         link.classList.add("hidden");
         link.removeAttribute("href");
         link.textContent = "";
         return;
       }
-      link.href = match[0];
-      link.textContent = match[0];
+      link.href = safeUrl;
+      link.textContent = safeUrl;
       link.classList.remove("hidden");
     }
 
@@ -1242,6 +1243,20 @@
     function formatLogEntry(entry) {
       const details = entry.data == null ? "" : `<br><small>${escapeHtml(JSON.stringify(entry.data))}</small>`;
       return `${escapeHtml(entry.message)}${details}`;
+    }
+
+    function stripAnsi(value) {
+      return String(value || "")
+        .replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g, "")
+        .replace(/\r\n/g, "\n")
+        .replace(/\r/g, "\n")
+        .replace(/\n{3,}/g, "\n\n")
+        .trimEnd();
+    }
+
+    function extractFirstUrl(value) {
+      const match = String(value || "").match(/https?:\/\/[^\s"'<>]+/);
+      return match ? match[0] : "";
     }
 
     function renderLimit(valueId, detailId, limit = {}) {

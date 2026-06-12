@@ -23,7 +23,7 @@ import { ClaudeProcessError, ClaudeRunnerOptions, resolveClaudeCommand } from ".
 import { AccountState } from "./account-state";
 import { AuditLog } from "./audit-log";
 import { ControlPlane } from "./control-plane";
-import { ClaudeAuthJob, splitCommandArgs } from "./claude-auth-job";
+import { ClaudeAuthJob, ClaudeAuthJobSnapshot, splitCommandArgs } from "./claude-auth-job";
 import { resolveDataDir } from "./data-dir";
 
 const PORT = parseInt(process.env.PORT || process.env.CC_PROXY_PORT || "3456", 10);
@@ -1375,8 +1375,10 @@ async function handleAdminRequest(
 
   if (req.method === "GET" && pathname === "/admin/claude-auth") {
     const config = controlPlane.getConfig();
+    const auth = claudeAuthJob.snapshot();
     sendJson(res, 200, {
-      auth: claudeAuthJob.snapshot(),
+      auth,
+      view: buildClaudeAuthView(auth),
       config: {
         claude_command: config.claude_command,
         claude_auth_login_args: config.claude_auth_login_args,
@@ -1475,6 +1477,35 @@ async function handleAdminRequest(
 
   sendJson(res, 404, { error: "admin route not found" });
   return true;
+}
+
+function buildClaudeAuthView(auth: ClaudeAuthJobSnapshot): { display_log: string; auth_url: string | null } {
+  const commandLine = auth.command ? `$ ${auth.command} ${(auth.args || []).join(" ")}` : "";
+  const displayLog = cleanTerminalText([
+    commandLine,
+    auth.started_at ? `started: ${auth.started_at}` : "",
+    auth.completed_at ? `completed: ${auth.completed_at}` : "",
+    auth.exit_code == null ? "" : `exit: ${auth.exit_code}`,
+    auth.log || "",
+  ].filter(Boolean).join("\n"));
+  return {
+    display_log: displayLog,
+    auth_url: extractFirstHttpUrl(displayLog),
+  };
+}
+
+function cleanTerminalText(value: string): string {
+  return String(value || "")
+    .replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trimEnd();
+}
+
+function extractFirstHttpUrl(value: string): string | null {
+  const match = String(value || "").match(/https?:\/\/[^\s"'<>]+/);
+  return match ? match[0] : null;
 }
 
 // ---- HTTP server ----
