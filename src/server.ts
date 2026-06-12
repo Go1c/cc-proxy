@@ -225,19 +225,29 @@ function shouldUseAnthropicUpstream(body: any): boolean {
 }
 
 function upstreamAuthConfig():
-  | { ok: true; key: string; mode: "x-api-key" | "authorization-bearer" }
+  | {
+      ok: true;
+      key: string;
+      mode: "x-api-key" | "authorization-bearer";
+      oauthBeta: boolean;
+    }
   | { ok: false; message: string } {
   if (ANTHROPIC_UPSTREAM_API_KEY) {
     const mode =
       ANTHROPIC_UPSTREAM_AUTH_HEADER === "authorization-bearer"
         ? "authorization-bearer"
         : "x-api-key";
-    return { ok: true, key: ANTHROPIC_UPSTREAM_API_KEY, mode };
+    return { ok: true, key: ANTHROPIC_UPSTREAM_API_KEY, mode, oauthBeta: false };
   }
 
   const oauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN || "";
   if (oauthToken) {
-    return { ok: true, key: oauthToken, mode: "authorization-bearer" };
+    return {
+      ok: true,
+      key: oauthToken,
+      mode: "authorization-bearer",
+      oauthBeta: true,
+    };
   }
 
   return {
@@ -344,8 +354,10 @@ async function forwardAnthropicMessagesToUpstream(
   };
 
   const clientBeta = headerValue(req, "anthropic-beta");
-  if (clientBeta || ANTHROPIC_UPSTREAM_BETA) {
-    upstreamHeaders["anthropic-beta"] = clientBeta || ANTHROPIC_UPSTREAM_BETA;
+  const oauthBeta = auth.oauthBeta ? "oauth-2025-04-20" : "";
+  const beta = clientBeta || ANTHROPIC_UPSTREAM_BETA || oauthBeta;
+  if (beta) {
+    upstreamHeaders["anthropic-beta"] = beta;
   }
 
   if (auth.mode === "authorization-bearer") {
