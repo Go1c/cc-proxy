@@ -1,5 +1,11 @@
 # CC Proxy Usage and Architecture
 
+> Current admin-based deployment guide: [ZEABUR_DEPLOYMENT.md](ZEABUR_DEPLOYMENT.md).
+> The older deployment notes below predate the admin control plane and may mention
+> environment-variable keys or ConfigMap-only `dist` mounts. For the current
+> commercial-style deployment, use the admin backend, Dockerfile, `public/`, and
+> persistent `CC_PROXY_DATA_DIR` flow in the Zeabur guide.
+
 ## Current Deployment
 
 Public base URL:

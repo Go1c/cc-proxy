@@ -1,5 +1,11 @@
 # Zeabur 部署状态与 TODO
 
+> 当前版本请优先看 `docs/ZEABUR_DEPLOYMENT.md`。
+> 本文件是旧 Zeabur 运行过程记录，里面的 `cc-proxy-dist` ConfigMap、
+> `CC_PROXY_API_KEY`、`CC_MAX_SESSIONS` 等说明属于后台控制平面之前的部署方式。
+> 新版本应通过 Dockerfile 部署完整镜像，包含 `dist/` 和 `public/`，并用
+> `CC_PROXY_DATA_DIR=/data/cc-proxy` 持久化后台配置、API Keys、日志和账号状态。
+
 目标链路：
 
 ```text
