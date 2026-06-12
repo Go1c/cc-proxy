@@ -1823,6 +1823,52 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       }
     });
 
+    it("allows the admin backend to send a bare Enter to the Claude auth process", async () => {
+      const dataDir = makeIsolatedDataDir("claude-auth-enter-input");
+      const resultPath = path.join(dataDir, "claude-auth-enter-input.json");
+      const fakeClaude = writeInteractiveClaudeAuthCommand(resultPath);
+      const proc = await startTestServer(ZEABUR_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const baseUrl = `http://localhost:${ZEABUR_PORT}`;
+        const adminToken = await bootstrapAdmin(baseUrl);
+
+        const updated = await httpPut(
+          `${baseUrl}/admin/config`,
+          {
+            claude_command: fakeClaude,
+            claude_auth_login_args: "manual-login",
+          },
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(updated.status, 200, updated.body);
+
+        const started = await httpPost(
+          `${baseUrl}/admin/claude-auth/login`,
+          {},
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(started.status, 202, started.body);
+
+        const inputRes = await httpPost(
+          `${baseUrl}/admin/claude-auth/input`,
+          { input: "" },
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(inputRes.status, 200, inputRes.body);
+
+        const recorded = await waitForJsonFile(resultPath);
+        assert.ok(recorded, "Claude auth Enter input file was not written");
+        assert.equal(recorded.input, "");
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
     it("cancels a stuck Claude account auth job and allows a new job to start", async () => {
       const dataDir = makeIsolatedDataDir("claude-auth-cancel");
       const envPath = path.join(dataDir, "claude-auth-env.json");

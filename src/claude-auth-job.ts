@@ -110,10 +110,7 @@ export class ClaudeAuthJob {
     if (!this.proc || this.state.status !== "running") {
       throw new Error("Claude auth job is not running");
     }
-    const value = String(input || "");
-    if (!value.trim()) {
-      throw new Error("Claude auth input is required");
-    }
+    const value = String(input ?? "");
     if (this.procKind === "pty") {
       (this.proc as nodePty.IPty).write(value.endsWith("\n") ? value : `${value}\n`);
       this.appendLog("\n[admin input submitted]\n");
