@@ -562,6 +562,7 @@
             </div>
             <div class="actions" style="margin-top: 10px;">
               <button id="claudeAuthInputButton" type="button" disabled>提交给 Claude CLI</button>
+              <button class="secondary" id="sendClaudeLoginCommandButton" type="button" disabled>发送 /login</button>
               <button class="secondary" id="copyClaudeAuthLogButton" type="button">复制日志</button>
             </div>
             <div class="auth-log-actions">
@@ -708,6 +709,8 @@
                 <tr>
                   <th>名称</th>
                   <th>前缀</th>
+                  <th>请求次数</th>
+                  <th>最近使用</th>
                   <th>创建时间</th>
                   <th>状态</th>
                   <th>操作</th>
@@ -759,7 +762,7 @@
                 <input id="claudeSettingSources" placeholder="例如 project,local">
               </label>
               <label>登录参数
-                <input id="claudeAuthLoginArgs" placeholder="默认 setup-token">
+                <input id="claudeAuthLoginArgs" placeholder="留空启动交互 Claude；可填 setup-token">
               </label>
               <label>认证检查参数
                 <input id="claudeAuthStatusArgs" placeholder="默认 --version">
@@ -1022,9 +1025,12 @@
       $("claudeAuthStatus").textContent = status;
       $("claudeAuthStatus").className = `status ${statusClass(status)}`;
       $("claudeAuthSummary").textContent = auth.started_at
-        ? `started ${formatDateTime(auth.started_at)}`
+        ? `${status === "running" ? "运行中" : "started"} ${formatDateTime(auth.started_at)}`
         : "-";
+      $("claudeLoginButton").disabled = status === "running";
+      $("claudeAuthCheckButton").disabled = status === "running";
       $("claudeAuthInputButton").disabled = status !== "running";
+      $("sendClaudeLoginCommandButton").disabled = status !== "running";
       $("cancelClaudeAuthButton").disabled = status !== "running";
       const logText = [
         auth.command ? `$ ${auth.command} ${(auth.args || []).join(" ")}` : "",
@@ -1041,8 +1047,8 @@
     }
 
     async function startClaudeAuth(path) {
-      setNotice("claudeAuthNotice", "认证任务已启动", "ok");
       await api(path, { method: "POST", body: "{}" });
+      setNotice("claudeAuthNotice", "认证任务已启动", "ok");
       await loadClaudeAuth();
     }
 
@@ -1064,6 +1070,11 @@
       $("claudeAuthInput").value = "";
       setNotice("claudeAuthNotice", "已提交给 Claude CLI", "ok");
       await loadClaudeAuth();
+    }
+
+    async function sendClaudeLoginCommand() {
+      $("claudeAuthInput").value = "/login";
+      await submitClaudeAuthInput();
     }
 
     function startAuthPolling() {
@@ -1131,11 +1142,11 @@
       $("apiKeyCount").textContent = keys.length;
       $("apiKeyDetail").textContent = `${keys.filter((key) => key.enabled).length} enabled`;
       if (!keys.length) {
-        $("apiKeys").innerHTML = `<tr><td class="empty" colspan="5">暂无 API Key</td></tr>`;
+        $("apiKeys").innerHTML = `<tr><td class="empty" colspan="7">暂无 API Key</td></tr>`;
         return;
       }
       $("apiKeys").innerHTML = keys.map((key) => (
-        `<tr><td>${escapeHtml(key.name)}</td><td>${escapeHtml(key.prefix)}</td><td>${escapeHtml(key.created_at)}</td><td><span class="status ${key.enabled ? "ready" : "closed"}">${key.enabled ? "enabled" : "disabled"}</span></td><td><div class="actions"><button class="secondary" type="button" data-key-action="toggle" data-key-id="${escapeHtml(key.id)}" data-key-enabled="${key.enabled ? "false" : "true"}">${key.enabled ? "禁用" : "启用"}</button><button class="danger" type="button" data-key-action="delete" data-key-id="${escapeHtml(key.id)}">删除</button></div></td></tr>`
+        `<tr><td>${escapeHtml(key.name)}</td><td>${escapeHtml(key.prefix)}</td><td>${Number(key.request_count || 0)}</td><td>${formatDateTime(key.last_used_at)}</td><td>${escapeHtml(key.created_at)}</td><td><span class="status ${key.enabled ? "ready" : "closed"}">${key.enabled ? "enabled" : "disabled"}</span></td><td><div class="actions"><button class="secondary" type="button" data-key-action="toggle" data-key-id="${escapeHtml(key.id)}" data-key-enabled="${key.enabled ? "false" : "true"}">${key.enabled ? "禁用" : "启用"}</button><button class="danger" type="button" data-key-action="delete" data-key-id="${escapeHtml(key.id)}">删除</button></div></td></tr>`
       )).join("");
     }
 
@@ -1368,6 +1379,7 @@
     $("claudeAuthCheckButton").onclick = () => runAction(() => startClaudeAuth("/admin/claude-auth/check"), "claudeAuthNotice");
     $("cancelClaudeAuthButton").onclick = () => runAction(cancelClaudeAuth, "claudeAuthNotice");
     $("claudeAuthInputButton").onclick = () => runAction(submitClaudeAuthInput, "claudeAuthNotice");
+    $("sendClaudeLoginCommandButton").onclick = () => runAction(sendClaudeLoginCommand, "claudeAuthNotice");
     $("copyClaudeAuthLogButton").onclick = () => copyText($("claudeAuthLog").textContent, "claudeAuthNotice");
     $("createKeyButton").onclick = () => runAction(createKey);
     $("copyCreatedKeyButton").onclick = () => copyText($("createdKey").dataset.value || "", "authNotice");

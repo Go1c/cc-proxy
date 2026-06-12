@@ -1488,11 +1488,11 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       assert.equal(resolved, "/src/.cc-proxy-data");
     });
 
-    it("defaults Claude account auth to setup-token instead of interactive login", () => {
-      assert.equal(defaultRuntimeConfig().claude_auth_login_args, "setup-token");
+    it("defaults Claude account auth to the interactive Claude session", () => {
+      assert.equal(defaultRuntimeConfig().claude_auth_login_args, "");
     });
 
-    it("migrates legacy Claude auth login args to setup-token", () => {
+    it("migrates legacy Claude auth login args to the interactive Claude session", () => {
       const dataDir = makeIsolatedDataDir("legacy-claude-auth-login-args");
       const controlPlanePath = path.join(dataDir, "control-plane.json");
       fs.mkdirSync(dataDir, { recursive: true });
@@ -1502,7 +1502,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
           admin: null,
           config: {
             ...defaultRuntimeConfig(),
-            claude_auth_login_args: "login",
+            claude_auth_login_args: "setup-token",
           },
           api_keys: [],
         }),
@@ -1510,7 +1510,17 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       );
 
       const controlPlane = new ControlPlane(controlPlanePath);
-      assert.equal(controlPlane.getConfig().claude_auth_login_args, "setup-token");
+      assert.equal(controlPlane.getConfig().claude_auth_login_args, "");
+    });
+
+    it("keeps explicitly configured setup-token args after the control plane has migrated", () => {
+      const dataDir = makeIsolatedDataDir("explicit-claude-setup-token-args");
+      const controlPlanePath = path.join(dataDir, "control-plane.json");
+      const controlPlane = new ControlPlane(controlPlanePath);
+      assert.equal(controlPlane.updateConfig({ claude_auth_login_args: "setup-token" }).claude_auth_login_args, "setup-token");
+
+      const reloaded = new ControlPlane(controlPlanePath);
+      assert.equal(reloaded.getConfig().claude_auth_login_args, "setup-token");
     });
 
     it("runs Claude account login from the admin backend and exposes auth logs", async () => {
@@ -1583,7 +1593,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
           `${baseUrl}/admin/config`,
           {
             claude_command: fakeClaude,
-            claude_auth_login_args: "setup-token",
+            claude_auth_login_args: "",
           },
           { Authorization: `Bearer ${adminToken}` }
         );
@@ -1609,7 +1619,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.equal(authBody.auth.status, "succeeded");
         assert.match(authBody.auth.log, /TTY Claude login URL/);
         const recorded = JSON.parse(fs.readFileSync(argsPath, "utf-8"));
-        assert.deepEqual(recorded.args, ["setup-token"]);
+        assert.deepEqual(recorded.args, []);
         assert.equal(recorded.stdoutIsTTY, true);
       } finally {
         proc.kill("SIGKILL");
@@ -1847,6 +1857,16 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
           { Authorization: `Bearer ${createdBody.key.value}` }
         );
         assert.equal(authorized.status, 400, authorized.body);
+
+        const keys = await httpGet(`${baseUrl}/admin/api-keys`, {
+          Authorization: `Bearer ${adminToken}`,
+        });
+        assert.equal(keys.status, 200, keys.body);
+        const keyBody = JSON.parse(keys.body);
+        const key = keyBody.keys.find((entry: any) => entry.id === createdBody.key.id);
+        assert.ok(key, "created key should be listed");
+        assert.equal(key.request_count, 1);
+        assert.match(key.last_used_at, /^\d{4}-\d{2}-\d{2}T/);
 
         const logs = await httpGet(`${baseUrl}/admin/logs`, {
           Authorization: `Bearer ${adminToken}`,
@@ -2148,9 +2168,13 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.match(res.body, /deleteKey/);
         assert.match(res.body, /claudeAuthInput/);
         assert.match(res.body, /\/admin\/claude-auth\/input/);
+        assert.match(res.body, /sendClaudeLoginCommandButton/);
+        assert.match(res.body, /\/login/);
         assert.match(res.body, /cancelClaudeAuthButton/);
         assert.match(res.body, /changeAdminPasswordButton/);
         assert.match(res.body, /\/admin\/auth\/password/);
+        assert.match(res.body, /最近使用/);
+        assert.match(res.body, /请求次数/);
         assert.match(res.body, /copyCreatedKeyButton/);
         assert.match(res.body, /logLevelFilter/);
         assert.match(res.body, /storageDataDir/);

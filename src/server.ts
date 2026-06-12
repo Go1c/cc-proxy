@@ -1412,7 +1412,7 @@ async function handleAdminRequest(
       const config = controlPlane.getConfig();
       const snapshot = claudeAuthJob.start({
         command: resolveClaudeCommand(config.claude_command || undefined),
-        args: splitCommandArgs(config.claude_auth_login_args || "setup-token"),
+        args: splitCommandArgs(config.claude_auth_login_args),
         cwd: SESSION_CWD,
         env: { HOME: CLAUDE_HOME_DIR },
         pseudoTty: true,

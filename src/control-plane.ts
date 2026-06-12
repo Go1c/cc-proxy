@@ -37,15 +37,19 @@ export interface StoredApiKey {
   prefix: string;
   created_at: string;
   enabled: boolean;
+  last_used_at: string | null;
+  request_count: number;
 }
 
 interface ControlPlaneState {
+  schema_version: number;
   admin: AdminUser | null;
   config: RuntimeConfig;
   api_keys: StoredApiKey[];
 }
 
-const DEFAULT_CLAUDE_AUTH_LOGIN_ARGS = "setup-token";
+const CONTROL_PLANE_SCHEMA_VERSION = 2;
+const DEFAULT_CLAUDE_AUTH_LOGIN_ARGS = "";
 
 export interface CreatedApiKey {
   id: string;
@@ -54,6 +58,8 @@ export interface CreatedApiKey {
   prefix: string;
   created_at: string;
   enabled: boolean;
+  last_used_at: string | null;
+  request_count: number;
 }
 
 export type PublicApiKey = Omit<StoredApiKey, "key_hash">;
@@ -145,6 +151,8 @@ export class ControlPlane {
       prefix: value.slice(0, 12),
       created_at: now,
       enabled: true,
+      last_used_at: null,
+      request_count: 0,
     };
     this.state.api_keys.push(stored);
     this.save();
@@ -155,6 +163,8 @@ export class ControlPlane {
       prefix: stored.prefix,
       created_at: stored.created_at,
       enabled: stored.enabled,
+      last_used_at: stored.last_used_at,
+      request_count: stored.request_count,
     };
   }
 
@@ -188,7 +198,12 @@ export class ControlPlane {
   verifyApiKey(value: string): boolean {
     if (!value) return false;
     const hash = hashApiKey(value);
-    return this.state.api_keys.some((key) => key.enabled && key.key_hash === hash);
+    const key = this.state.api_keys.find((entry) => entry.enabled && entry.key_hash === hash);
+    if (!key) return false;
+    key.request_count = Math.max(0, Math.trunc(Number(key.request_count) || 0)) + 1;
+    key.last_used_at = new Date().toISOString();
+    this.save();
+    return true;
   }
 
   private issueAdminToken(username: string): string {
@@ -202,6 +217,7 @@ export class ControlPlane {
 
   private load(defaults: Partial<RuntimeConfig>): ControlPlaneState {
     const defaultState: ControlPlaneState = {
+      schema_version: CONTROL_PLANE_SCHEMA_VERSION,
       admin: null,
       config: normalizeRuntimeConfig({ ...defaultRuntimeConfig(), ...defaults }),
       api_keys: [],
@@ -209,14 +225,26 @@ export class ControlPlane {
     try {
       if (!fs.existsSync(this.filePath)) return defaultState;
       const parsed = JSON.parse(fs.readFileSync(this.filePath, "utf-8"));
+      const schemaVersion = Number.isInteger(parsed.schema_version) ? parsed.schema_version : 1;
+      const parsedConfig =
+        parsed.config && typeof parsed.config === "object"
+          ? (parsed.config as Record<string, unknown>)
+          : {};
+      const config = normalizeRuntimeConfig({
+        ...defaultState.config,
+        ...parsedConfig,
+      });
+      if (schemaVersion < CONTROL_PLANE_SCHEMA_VERSION && parsedConfig.claude_auth_login_args === "setup-token") {
+        config.claude_auth_login_args = DEFAULT_CLAUDE_AUTH_LOGIN_ARGS;
+      }
       return {
+        schema_version: CONTROL_PLANE_SCHEMA_VERSION,
         admin: isAdminUser(parsed.admin) ? parsed.admin : null,
-        config: normalizeRuntimeConfig({
-          ...defaultState.config,
-          ...(parsed.config && typeof parsed.config === "object" ? parsed.config : {}),
-        }),
+        config,
         api_keys: Array.isArray(parsed.api_keys)
-          ? parsed.api_keys.filter(isStoredApiKey)
+          ? (parsed.api_keys as unknown[])
+              .map(normalizeStoredApiKey)
+              .filter((key): key is StoredApiKey => !!key)
           : [],
       };
     } catch {
@@ -337,15 +365,25 @@ function isAdminUser(value: unknown): value is AdminUser {
   );
 }
 
-function isStoredApiKey(value: unknown): value is StoredApiKey {
-  if (!value || typeof value !== "object") return false;
+function normalizeStoredApiKey(value: unknown): StoredApiKey | null {
+  if (!value || typeof value !== "object") return null;
   const key = value as Partial<StoredApiKey>;
-  return (
+  const validBase =
     typeof key.id === "string" &&
     typeof key.name === "string" &&
     typeof key.key_hash === "string" &&
     typeof key.prefix === "string" &&
     typeof key.created_at === "string" &&
-    typeof key.enabled === "boolean"
-  );
+    typeof key.enabled === "boolean";
+  if (!validBase) return null;
+  return {
+    id: key.id as string,
+    name: key.name as string,
+    key_hash: key.key_hash as string,
+    prefix: key.prefix as string,
+    created_at: key.created_at as string,
+    enabled: key.enabled as boolean,
+    last_used_at: typeof key.last_used_at === "string" ? key.last_used_at : null,
+    request_count: boundedInt(key.request_count, 0, Number.MAX_SAFE_INTEGER, 0),
+  };
 }
