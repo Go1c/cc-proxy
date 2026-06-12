@@ -3,3 +3,5 @@ dist/
 *.log
 .env
 .env.*
+.cc-proxy-data/
+test-workspace/.cc-proxy-*/

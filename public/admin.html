@@ -1,0 +1,585 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CC Proxy Admin</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f8fb;
+      --panel: #ffffff;
+      --ink: #1b2330;
+      --muted: #667085;
+      --line: #d8dee8;
+      --brand: #1664d9;
+      --danger: #b42318;
+      --ok: #067647;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+    h1, h2 {
+      margin: 0;
+      letter-spacing: 0;
+    }
+    h1 { font-size: 20px; }
+    h2 { font-size: 15px; }
+    main {
+      width: min(1180px, calc(100vw - 32px));
+      margin: 20px auto 40px;
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      gap: 16px;
+    }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    .stack { display: grid; gap: 16px; }
+    .form { display: grid; gap: 10px; margin-top: 14px; }
+    label {
+      display: grid;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }
+    input {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 9px 10px;
+      color: var(--ink);
+      background: #fff;
+      font: inherit;
+    }
+    button {
+      border: 0;
+      border-radius: 6px;
+      padding: 9px 12px;
+      background: var(--brand);
+      color: #fff;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button.secondary {
+      background: #edf2f7;
+      color: var(--ink);
+      border: 1px solid var(--line);
+    }
+    button.danger {
+      background: #fee4e2;
+      color: var(--danger);
+      border: 1px solid #fda29b;
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: #edf2f7;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .status.ready { color: var(--ok); background: #dcfae6; }
+    .status.cooldown, .status.error { color: var(--danger); background: #fee4e2; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 9px 6px;
+      text-align: left;
+      vertical-align: top;
+      overflow-wrap: anywhere;
+    }
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    pre {
+      max-height: 260px;
+      overflow: auto;
+      margin: 12px 0 0;
+      padding: 10px;
+      border-radius: 6px;
+      background: #101828;
+      color: #f9fafb;
+      font-size: 12px;
+      white-space: pre-wrap;
+    }
+    .notice {
+      margin-top: 10px;
+      color: var(--muted);
+      min-height: 20px;
+    }
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      background: #fbfcfe;
+      min-width: 0;
+    }
+    .metric span,
+    .metric small {
+      display: block;
+      color: var(--muted);
+      overflow-wrap: anywhere;
+    }
+    .metric span {
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .metric strong {
+      display: block;
+      margin-top: 4px;
+      font-size: 18px;
+      line-height: 1.2;
+      overflow-wrap: anywhere;
+    }
+    .metric small { margin-top: 4px; }
+    .empty {
+      color: var(--muted);
+      text-align: center;
+    }
+    @media (max-width: 820px) {
+      main { grid-template-columns: 1fr; }
+      header { align-items: flex-start; flex-direction: column; }
+      .metric-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1 id="cc-proxy-admin">CC Proxy Admin</h1>
+      <div class="notice" id="sessionState">未登录</div>
+    </div>
+    <button class="secondary" id="refreshButton">刷新</button>
+  </header>
+  <main>
+    <div class="stack">
+      <section>
+        <div class="row">
+          <h2>管理员</h2>
+          <span class="status" id="authState">locked</span>
+        </div>
+        <div class="form">
+          <label>用户名<input id="username" autocomplete="username" value="admin"></label>
+          <label>密码<input id="password" type="password" autocomplete="current-password"></label>
+          <div class="row">
+            <button id="loginButton">登录</button>
+            <button class="secondary" id="setupButton">初始化</button>
+          </div>
+        </div>
+        <div class="notice" id="authNotice"></div>
+      </section>
+      <section>
+        <h2>运行配置</h2>
+        <div class="form">
+          <label>最大 CLI 数量<input id="maxCliWindows" type="number" min="1"></label>
+          <label>CLI 单次等待 ms<input id="cliTurnTimeoutMs" type="number" min="1000"></label>
+          <label>CLI 空闲释放 ms<input id="cliIdleTimeoutMs" type="number" min="1000"></label>
+          <label>限额冷却 ms<input id="quotaCooldownMs" type="number" min="0"></label>
+          <label>Claude 命令路径<input id="claudeCommand" placeholder="默认使用内置 claude"></label>
+          <label>默认 Claude 模型<input id="claudeModel" placeholder="例如 claude-sonnet-4-6"></label>
+          <label>权限模式<input id="claudePermissionMode" placeholder="例如 acceptEdits"></label>
+          <label>推理力度<input id="claudeEffort" placeholder="low / medium / high"></label>
+          <label>Setting Sources<input id="claudeSettingSources" placeholder="例如 project,local"></label>
+          <label>登录参数<input id="claudeAuthLoginArgs" placeholder="默认 login"></label>
+          <label>认证检查参数<input id="claudeAuthStatusArgs" placeholder="默认 --version"></label>
+          <label>Client Tool 等待 ms<input id="clientToolTimeoutMs" type="number" min="1000"></label>
+          <button id="saveConfigButton">保存配置</button>
+        </div>
+      </section>
+      <section>
+        <div class="row">
+          <h2>Claude 登录认证</h2>
+          <span class="status" id="claudeAuthStatus">idle</span>
+        </div>
+        <div class="form">
+          <div class="row">
+            <button id="claudeLoginButton">登录</button>
+            <button class="secondary" id="claudeAuthCheckButton">检查</button>
+          </div>
+        </div>
+        <pre id="claudeAuthLog"></pre>
+      </section>
+    </div>
+    <div class="stack">
+      <section>
+        <div class="row">
+          <h2>Claude 账号</h2>
+          <span class="status" id="accountStatus">unknown</span>
+        </div>
+        <div class="metric-grid">
+          <div class="metric">
+            <span>5小时限额</span>
+            <strong id="fiveHourLimit">unknown</strong>
+            <small id="fiveHourLimitDetail">-</small>
+          </div>
+          <div class="metric">
+            <span>本周限额</span>
+            <strong id="weeklyLimit">unknown</strong>
+            <small id="weeklyLimitDetail">-</small>
+          </div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>时间窗口</th>
+              <th>请求</th>
+              <th>Token</th>
+              <th>费用</th>
+              <th>平均耗时</th>
+              <th>缓存读取率</th>
+            </tr>
+          </thead>
+          <tbody id="accountUsageRows"></tbody>
+        </table>
+        <pre id="accountJson">{}</pre>
+      </section>
+      <section>
+        <div class="row">
+          <h2>CLI 窗口</h2>
+          <span class="status" id="cliWindowState">0/0</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>状态</th>
+              <th>轮次</th>
+              <th>Token</th>
+              <th>费用</th>
+              <th>平均耗时</th>
+              <th>缓存读取率</th>
+              <th>最近活跃</th>
+            </tr>
+          </thead>
+          <tbody id="cliWindows"></tbody>
+        </table>
+      </section>
+      <section>
+        <h2>下游 API Key</h2>
+        <div class="form">
+          <label>名称<input id="apiKeyName" value="production-client"></label>
+          <button id="createKeyButton">创建 Key</button>
+        </div>
+        <pre id="createdKey"></pre>
+        <table>
+          <thead><tr><th>名称</th><th>前缀</th><th>创建时间</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="apiKeys"></tbody>
+        </table>
+      </section>
+      <section>
+        <h2>日志</h2>
+        <table>
+          <thead><tr><th>时间</th><th>级别</th><th>事件</th><th>内容</th></tr></thead>
+          <tbody id="logs"></tbody>
+        </table>
+      </section>
+    </div>
+  </main>
+  <script>
+    const tokenKey = "cc_proxy_admin_token";
+    let token = localStorage.getItem(tokenKey) || "";
+
+    const $ = (id) => document.getElementById(id);
+
+    function setNotice(id, text) {
+      $(id).textContent = text || "";
+    }
+
+    function setToken(nextToken) {
+      token = nextToken || "";
+      if (token) localStorage.setItem(tokenKey, token);
+      else localStorage.removeItem(tokenKey);
+      $("authState").textContent = token ? "active" : "locked";
+      $("authState").className = `status ${token ? "ready" : ""}`;
+      $("sessionState").textContent = token ? "已登录" : "未登录";
+    }
+
+    async function api(path, options = {}) {
+      const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+      if (token) headers.Authorization = `Bearer ${token}`;
+      const res = await fetch(path, { ...options, headers });
+      const text = await res.text();
+      let body = {};
+      try { body = text ? JSON.parse(text) : {}; } catch { body = { raw: text }; }
+      if (!res.ok) throw new Error(body.error || body.error?.message || text || `HTTP ${res.status}`);
+      return body;
+    }
+
+    async function authenticate(path) {
+      const username = $("username").value;
+      const password = $("password").value;
+      const body = await api(path, {
+        method: "POST",
+        body: JSON.stringify({ username, password }),
+        headers: {},
+      });
+      setToken(body.token);
+      setNotice("authNotice", "OK");
+      await refreshAll();
+    }
+
+    async function loadConfig() {
+      const { config } = await api("/admin/config");
+      $("maxCliWindows").value = config.max_cli_windows;
+      $("cliTurnTimeoutMs").value = config.cli_turn_timeout_ms;
+      $("cliIdleTimeoutMs").value = config.cli_idle_timeout_ms;
+      $("quotaCooldownMs").value = config.quota_cooldown_ms;
+      $("claudeCommand").value = config.claude_command || "";
+      $("claudeModel").value = config.claude_model || "";
+      $("claudePermissionMode").value = config.claude_permission_mode || "";
+      $("claudeEffort").value = config.claude_effort || "";
+      $("claudeSettingSources").value = config.claude_setting_sources || "";
+      $("claudeAuthLoginArgs").value = config.claude_auth_login_args || "";
+      $("claudeAuthStatusArgs").value = config.claude_auth_status_args || "";
+      $("clientToolTimeoutMs").value = config.client_tool_timeout_ms;
+    }
+
+    async function saveConfig() {
+      const config = {
+        max_cli_windows: Number($("maxCliWindows").value),
+        cli_turn_timeout_ms: Number($("cliTurnTimeoutMs").value),
+        cli_idle_timeout_ms: Number($("cliIdleTimeoutMs").value),
+        quota_cooldown_ms: Number($("quotaCooldownMs").value),
+        claude_command: $("claudeCommand").value,
+        claude_model: $("claudeModel").value,
+        claude_permission_mode: $("claudePermissionMode").value,
+        claude_effort: $("claudeEffort").value,
+        claude_setting_sources: $("claudeSettingSources").value,
+        claude_auth_login_args: $("claudeAuthLoginArgs").value,
+        claude_auth_status_args: $("claudeAuthStatusArgs").value,
+        client_tool_timeout_ms: Number($("clientToolTimeoutMs").value),
+      };
+      await api("/admin/config", { method: "PUT", body: JSON.stringify(config) });
+      await refreshAll();
+    }
+
+    async function loadClaudeAuth() {
+      const { auth } = await api("/admin/claude-auth");
+      $("claudeAuthStatus").textContent = auth.status;
+      $("claudeAuthStatus").className = `status ${statusClass(auth.status)}`;
+      $("claudeAuthLog").textContent = [
+        auth.command ? `$ ${auth.command} ${(auth.args || []).join(" ")}` : "",
+        auth.started_at ? `started: ${auth.started_at}` : "",
+        auth.completed_at ? `completed: ${auth.completed_at}` : "",
+        auth.exit_code == null ? "" : `exit: ${auth.exit_code}`,
+        auth.log || "",
+      ].filter(Boolean).join("\n");
+    }
+
+    async function startClaudeAuth(path) {
+      await api(path, { method: "POST", body: "{}" });
+      await loadClaudeAuth();
+    }
+
+    async function loadAccount() {
+      const { account } = await api("/admin/account");
+      $("accountStatus").textContent = account.status;
+      $("accountStatus").className = `status ${account.status}`;
+      renderLimit("fiveHourLimit", "fiveHourLimitDetail", account.limits?.five_hour);
+      renderLimit("weeklyLimit", "weeklyLimitDetail", account.limits?.weekly);
+      $("accountUsageRows").innerHTML = [
+        ["今日", account.usage.today],
+        ["本周", account.usage.week],
+        ["本月", account.usage.month],
+      ].map(([label, usage]) => (
+        `<tr><td>${label}</td><td>${usage.request_count}</td><td>${formatTokenUsage(usage)}</td><td>${formatUsd(usage.cost_usd)}</td><td>${formatDuration(usage.average_duration_ms)}</td><td>${formatPercent(usage.cache_read_rate)}</td></tr>`
+      )).join("");
+      $("accountJson").textContent = JSON.stringify(account, null, 2);
+    }
+
+    async function loadCliWindows() {
+      const body = await api("/admin/cli-windows");
+      $("cliWindowState").textContent = `${body.active}/${body.limit}`;
+      $("cliWindowState").className = `status ${body.active > 0 ? "ready" : ""}`;
+      if (!body.windows.length) {
+        $("cliWindows").innerHTML = `<tr><td class="empty" colspan="8">暂无 CLI 窗口</td></tr>`;
+        return;
+      }
+      $("cliWindows").innerHTML = body.windows.map((window) => (
+        `<tr><td>${escapeHtml(shortId(window.id))}<br>${escapeHtml(window.cli_session_id || "-")}</td><td><span class="status ${statusClass(window.state)}">${escapeHtml(window.state)}</span></td><td>${window.turns}</td><td>${formatTokenUsage(window.usage)}</td><td>${formatUsd(window.usage.cost_usd)}</td><td>${formatDuration(window.usage.average_duration_ms)}</td><td>${formatPercent(window.usage.cache_read_rate)}</td><td>${formatTime(window.last_active_at)}</td></tr>`
+      )).join("");
+    }
+
+    async function loadKeys() {
+      const { keys } = await api("/admin/api-keys");
+      if (!keys.length) {
+        $("apiKeys").innerHTML = `<tr><td class="empty" colspan="5">暂无 API Key</td></tr>`;
+        return;
+      }
+      $("apiKeys").innerHTML = keys.map((key) => (
+        `<tr><td>${escapeHtml(key.name)}</td><td>${escapeHtml(key.prefix)}</td><td>${escapeHtml(key.created_at)}</td><td>${key.enabled ? "enabled" : "disabled"}</td><td><div class="actions"><button class="secondary" data-key-action="toggle" data-key-id="${escapeHtml(key.id)}" data-key-enabled="${key.enabled ? "false" : "true"}">${key.enabled ? "禁用" : "启用"}</button><button class="danger" data-key-action="delete" data-key-id="${escapeHtml(key.id)}">删除</button></div></td></tr>`
+      )).join("");
+    }
+
+    async function createKey() {
+      const body = await api("/admin/api-keys", {
+        method: "POST",
+        body: JSON.stringify({ name: $("apiKeyName").value }),
+      });
+      $("createdKey").textContent = body.key.value;
+      await loadKeys();
+      await loadLogs();
+    }
+
+    async function toggleKey(id, enabled) {
+      await api(`/admin/api-keys/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ enabled }),
+      });
+      await loadKeys();
+      await loadLogs();
+    }
+
+    async function deleteKey(id) {
+      if (!confirm("删除这个 API Key?")) return;
+      await api(`/admin/api-keys/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      });
+      await loadKeys();
+      await loadLogs();
+    }
+
+    async function loadLogs() {
+      const { logs } = await api("/admin/logs?limit=100");
+      $("logs").innerHTML = logs.map((entry) => (
+        `<tr><td>${escapeHtml(entry.at)}</td><td>${escapeHtml(entry.level)}</td><td>${escapeHtml(entry.event)}</td><td>${formatLogEntry(entry)}</td></tr>`
+      )).join("");
+    }
+
+    async function refreshAll() {
+      if (!token) return;
+      await Promise.all([loadConfig(), loadClaudeAuth(), loadAccount(), loadCliWindows(), loadKeys(), loadLogs()]);
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      }[char]));
+    }
+
+    function formatPercent(value) {
+      const number = Number(value);
+      if (!Number.isFinite(number)) return "0.00%";
+      return `${(number * 100).toFixed(2)}%`;
+    }
+
+    function formatUsd(value) {
+      return `$${Number(value || 0).toFixed(4)}`;
+    }
+
+    function formatDuration(value) {
+      return `${Number(value || 0).toFixed(2)}ms`;
+    }
+
+    function formatTokenUsage(usage = {}) {
+      const total = Number(usage.total_tokens || 0);
+      const input = Number(usage.input_tokens || 0);
+      const output = Number(usage.output_tokens || 0);
+      const created = Number(usage.cache_creation_input_tokens || 0);
+      const read = Number(usage.cache_read_input_tokens || 0);
+      return `${total}<br><small>入 ${input} / 出 ${output} / 建 ${created} / 读 ${read}</small>`;
+    }
+
+    function formatLogEntry(entry) {
+      const details = entry.data == null ? "" : `<br><small>${escapeHtml(JSON.stringify(entry.data))}</small>`;
+      return `${escapeHtml(entry.message)}${details}`;
+    }
+
+    function renderLimit(valueId, detailId, limit = {}) {
+      const status = limit.status || "unknown";
+      const percent = limit.percent_remaining == null ? "" : ` / 剩余 ${formatPercent(limit.percent_remaining)}`;
+      $(valueId).textContent = `${status}${percent}`;
+      const detail = [limit.reset_at ? `重置 ${limit.reset_at}` : "", limit.message || ""].filter(Boolean).join(" / ");
+      $(detailId).textContent = detail || "-";
+    }
+
+    function shortId(value) {
+      const text = String(value || "");
+      return text.length > 12 ? `${text.slice(0, 8)}...` : text;
+    }
+
+    function statusClass(state) {
+      if (state === "ready") return "ready";
+      if (state === "succeeded") return "ready";
+      if (state === "failed" || state === "closed") return "error";
+      return "";
+    }
+
+    function formatTime(value) {
+      const date = new Date(Number(value || 0));
+      return Number.isFinite(date.getTime()) ? date.toLocaleString() : "-";
+    }
+
+    $("setupButton").onclick = () => authenticate("/admin/setup").catch((err) => setNotice("authNotice", err.message));
+    $("loginButton").onclick = () => authenticate("/admin/auth/login").catch((err) => setNotice("authNotice", err.message));
+    $("saveConfigButton").onclick = () => saveConfig().catch((err) => setNotice("authNotice", err.message));
+    $("claudeLoginButton").onclick = () => startClaudeAuth("/admin/claude-auth/login").catch((err) => setNotice("authNotice", err.message));
+    $("claudeAuthCheckButton").onclick = () => startClaudeAuth("/admin/claude-auth/check").catch((err) => setNotice("authNotice", err.message));
+    $("createKeyButton").onclick = () => createKey().catch((err) => setNotice("authNotice", err.message));
+    $("apiKeys").onclick = (event) => {
+      const button = event.target instanceof Element
+        ? event.target.closest("button[data-key-action]")
+        : null;
+      if (!button) return;
+      const id = button.dataset.keyId;
+      if (!id) return;
+      if (button.dataset.keyAction === "toggle") {
+        toggleKey(id, button.dataset.keyEnabled === "true").catch((err) => setNotice("authNotice", err.message));
+      } else if (button.dataset.keyAction === "delete") {
+        deleteKey(id).catch((err) => setNotice("authNotice", err.message));
+      }
+    };
+    $("refreshButton").onclick = () => refreshAll().catch((err) => setNotice("authNotice", err.message));
+    setToken(token);
+    refreshAll().catch(() => {});
+  </script>
+</body>
+</html>

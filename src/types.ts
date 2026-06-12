@@ -63,6 +63,25 @@ export interface TurnUsage {
   total_cost_usd: number;
 }
 
+export interface TurnErrorDetails {
+  status_code?: number;
+  type?: string;
+  message?: string;
+  body?: unknown;
+}
+
+export interface SessionUsageSummary {
+  request_count: number;
+  cost_usd: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+  total_tokens: number;
+  average_duration_ms: number;
+  cache_read_rate: number;
+}
+
 export type ClaudeContentBlock = {
   type: string;
   [key: string]: unknown;
@@ -87,6 +106,7 @@ export interface TurnResult {
   duration_ms: number;
   num_turns: number;
   is_error: boolean;
+  error?: TurnErrorDetails;
   stop_reason?: string | null;
 }
 
@@ -104,4 +124,6 @@ export interface SessionInfo {
   last_active_at: number;
   turns: number;
   cli_session_id: string | null;
+  usage: SessionUsageSummary;
+  last_error: TurnErrorDetails | null;
 }

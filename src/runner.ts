@@ -6,6 +6,7 @@ import {
   ClaudeContentBlock,
   ClaudeStreamMessage,
   ClaudeTurnInput,
+  TurnErrorDetails,
   TurnResult,
   TurnUsage,
 } from "./types";
@@ -14,6 +15,21 @@ const DEFAULT_TURN_TIMEOUT_MS = parseInt(
   process.env.CC_TURN_TIMEOUT_MS || "120000",
   10
 );
+const MAX_STDERR_CHARS = 64 * 1024;
+
+export class ClaudeProcessError extends Error {
+  constructor(
+    message: string,
+    public readonly details: {
+      exitCode?: number | null;
+      signal?: NodeJS.Signals | null;
+      stderr?: string;
+    } = {}
+  ) {
+    super(message);
+    this.name = "ClaudeProcessError";
+  }
+}
 
 interface PendingTurn {
   resolve: (r: TurnResult) => void;
@@ -25,6 +41,7 @@ interface PendingTurn {
 }
 
 export interface ClaudeRunnerOptions {
+  command?: string;
   model?: string;
   permissionMode?: string;
   effort?: string;
@@ -38,8 +55,8 @@ export interface TurnCallbacks {
   onStreamEvent?: (event: any, raw: any) => void;
 }
 
-export function resolveClaudeCommand(): string {
-  if (process.env.CLAUDE_COMMAND) return process.env.CLAUDE_COMMAND;
+export function resolveClaudeCommand(command?: string): string {
+  if (command) return command;
 
   const packageRoot = path.resolve(__dirname, "..", "node_modules", "@anthropic-ai");
   const nativePackages: string[] = [];
@@ -85,19 +102,19 @@ export function resolveClaudeArgs(options: ClaudeRunnerOptions = {}): string[] {
     "--include-partial-messages",
     "--verbose",
   ];
-  const model = options.model || process.env.CC_CLAUDE_MODEL;
+  const model = options.model;
   if (model) {
     args.push("--model", model);
   }
-  const permissionMode = options.permissionMode || process.env.CC_PERMISSION_MODE;
+  const permissionMode = options.permissionMode;
   if (permissionMode) {
     args.push("--permission-mode", permissionMode);
   }
-  const effort = options.effort || process.env.CC_CLAUDE_EFFORT;
+  const effort = options.effort;
   if (effort) {
     args.push("--effort", effort);
   }
-  const settingSources = options.settingSources || process.env.CC_CLAUDE_SETTING_SOURCES;
+  const settingSources = options.settingSources;
   if (settingSources) {
     args.push("--setting-sources", settingSources);
   }
@@ -120,6 +137,7 @@ export function resolveClaudeArgs(options: ClaudeRunnerOptions = {}): string[] {
 export class ClaudeRunner extends EventEmitter {
   private proc: ChildProcessWithoutNullStreams | null = null;
   private stdoutBuf = "";
+  private stderrBuf = "";
   private pending: PendingTurn | null = null;
   private cliSessionId: string | null = null;
   private closed = false;
@@ -134,16 +152,14 @@ export class ClaudeRunner extends EventEmitter {
   start(): void {
     if (this.proc) return;
     this.proc = spawn(
-      resolveClaudeCommand(),
+      resolveClaudeCommand(this.options.command),
       resolveClaudeArgs(this.options),
       { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"] }
     );
 
     this.proc.stdout.on("data", (c: Buffer) => this.onStdout(c));
-    this.proc.stderr.on("data", () => {
-      /* swallow CLI stderr; surfaced via exit if fatal */
-    });
-    this.proc.on("exit", (code) => this.onExit(code));
+    this.proc.stderr.on("data", (c: Buffer) => this.onStderr(c));
+    this.proc.on("exit", (code, signal) => this.onExit(code, signal));
     this.proc.on("error", (err) => this.fail(err));
   }
 
@@ -220,6 +236,13 @@ export class ClaudeRunner extends EventEmitter {
     }
   }
 
+  private onStderr(chunk: Buffer): void {
+    this.stderrBuf += chunk.toString("utf-8");
+    if (this.stderrBuf.length > MAX_STDERR_CHARS) {
+      this.stderrBuf = this.stderrBuf.slice(this.stderrBuf.length - MAX_STDERR_CHARS);
+    }
+  }
+
   private onLine(line: string): void {
     let obj: any;
     try {
@@ -280,17 +303,24 @@ export class ClaudeRunner extends EventEmitter {
       duration_ms: obj.duration_ms || 0,
       num_turns: obj.num_turns || 0,
       is_error: !!obj.is_error,
+      error: normalizeTurnError(obj.error, resultText),
       stop_reason: obj.stop_reason || null,
     });
   }
 
-  private onExit(code: number | null): void {
+  private onExit(code: number | null, signal: NodeJS.Signals | null): void {
     if (this.closed) return;
     this.closed = true;
     this.proc = null;
     if (this.pending) {
       clearTimeout(this.pending.timer);
-      this.pending.reject(new Error(`claude process exited (code ${code})`));
+      this.pending.reject(
+        new ClaudeProcessError(`claude process exited (code ${code})`, {
+          exitCode: code,
+          signal,
+          stderr: this.stderrBuf,
+        })
+      );
       this.pending = null;
     }
     this.emit("exit", code);
@@ -304,6 +334,18 @@ export class ClaudeRunner extends EventEmitter {
     }
     this.emit("error", err);
   }
+}
+
+function normalizeTurnError(error: unknown, fallbackMessage: string): TurnErrorDetails | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const raw = error as Record<string, unknown>;
+  const normalized: TurnErrorDetails = {};
+  if (typeof raw.status_code === "number") normalized.status_code = raw.status_code;
+  if (typeof raw.type === "string") normalized.type = raw.type;
+  if (typeof raw.message === "string") normalized.message = raw.message;
+  else if (fallbackMessage) normalized.message = fallbackMessage;
+  if ("body" in raw) normalized.body = raw.body;
+  return normalized;
 }
 
 function normalizeTurnInput(input: ClaudeTurnInput): ClaudeStreamMessage[] {

@@ -26,10 +26,19 @@ function sleep(ms: number): Promise<void> {
 }
 
 function httpGet(
-  url: string
+  url: string,
+  headers: Record<string, string> = {}
 ): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
   return new Promise((resolve) => {
-    const req = http.get(url, (res) => {
+    const urlObj = new URL(url);
+    const req = http.get(
+      {
+        hostname: urlObj.hostname,
+        port: urlObj.port,
+        path: `${urlObj.pathname}${urlObj.search}`,
+        headers,
+      },
+      (res) => {
       const chunks: Buffer[] = [];
       res.on("data", (c: Buffer) => chunks.push(c));
       res.on("end", () => {
@@ -63,6 +72,90 @@ function httpPost(
       port: urlObj.port,
       path: urlObj.pathname,
       method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(data),
+        ...headers,
+      },
+    };
+    const req = http.request(options, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (c: Buffer) => chunks.push(c));
+      res.on("end", () => {
+        resolve({
+          status: res.statusCode || 0,
+          body: Buffer.concat(chunks).toString("utf-8"),
+          headers: res.headers,
+        });
+      });
+    });
+    req.on("error", (err) =>
+      resolve({ status: 0, body: err.message, headers: {} })
+    );
+    req.setTimeout(5000, () => {
+      req.destroy();
+      resolve({ status: 0, body: "timeout", headers: {} });
+    });
+    req.write(data);
+    req.end();
+  });
+}
+
+function httpPut(
+  url: string,
+  body: unknown,
+  headers: Record<string, string> = {}
+): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
+  return new Promise((resolve) => {
+    const data = JSON.stringify(body);
+    const urlObj = new URL(url);
+    const options = {
+      hostname: urlObj.hostname,
+      port: urlObj.port,
+      path: urlObj.pathname,
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(data),
+        ...headers,
+      },
+    };
+    const req = http.request(options, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (c: Buffer) => chunks.push(c));
+      res.on("end", () => {
+        resolve({
+          status: res.statusCode || 0,
+          body: Buffer.concat(chunks).toString("utf-8"),
+          headers: res.headers,
+        });
+      });
+    });
+    req.on("error", (err) =>
+      resolve({ status: 0, body: err.message, headers: {} })
+    );
+    req.setTimeout(5000, () => {
+      req.destroy();
+      resolve({ status: 0, body: "timeout", headers: {} });
+    });
+    req.write(data);
+    req.end();
+  });
+}
+
+function httpPatch(
+  url: string,
+  body: unknown,
+  headers: Record<string, string> = {}
+): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
+  return new Promise((resolve) => {
+    const data = JSON.stringify(body);
+    const urlObj = new URL(url);
+    const options = {
+      hostname: urlObj.hostname,
+      port: urlObj.port,
+      path: urlObj.pathname,
+      method: "PATCH",
       headers: {
         "Content-Type": "application/json",
         "Content-Length": Buffer.byteLength(data),
@@ -230,6 +323,58 @@ function readServerFile(relativePath: string): string {
   return fs.readFileSync(path.join(TEST_WORKSPACE, relativePath), "utf-8");
 }
 
+async function waitForFile(filePath: string, timeoutMs = 2_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(filePath)) return true;
+    await sleep(25);
+  }
+  return fs.existsSync(filePath);
+}
+
+function makeIsolatedDataDir(name: string): string {
+  const safeName = name.replace(/[^a-z0-9_-]/gi, "-").toLowerCase();
+  const dir = path.join(
+    TEST_WORKSPACE,
+    `.cc-proxy-${safeName}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  );
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+async function bootstrapAdmin(
+  baseUrl: string,
+  username = "admin",
+  password = "admin-secret"
+): Promise<string> {
+  const setup = await httpPost(`${baseUrl}/admin/setup`, { username, password });
+  assert.equal(setup.status, 201, setup.body);
+  const setupBody = JSON.parse(setup.body);
+  assert.match(setupBody.token, /^adm_/);
+
+  const login = await httpPost(`${baseUrl}/admin/auth/login`, { username, password });
+  assert.equal(login.status, 200, login.body);
+  const loginBody = JSON.parse(login.body);
+  assert.match(loginBody.token, /^adm_/);
+  return loginBody.token;
+}
+
+async function createDownstreamKey(
+  baseUrl: string,
+  adminToken: string,
+  name = "test-client"
+): Promise<{ id: string; value: string }> {
+  const created = await httpPost(
+    `${baseUrl}/admin/api-keys`,
+    { name },
+    { Authorization: `Bearer ${adminToken}` }
+  );
+  assert.equal(created.status, 201, created.body);
+  const body = JSON.parse(created.body);
+  assert.match(body.key.value, /^ccp_/);
+  return { id: body.key.id, value: body.key.value };
+}
+
 function writeFakeClaudeCommand(resultText = "FAKE_STREAM_RESULT"): string {
   const scriptPath = path.join(TEST_WORKSPACE, `fake-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
   fs.writeFileSync(
@@ -260,6 +405,105 @@ process.stdin.on("data", (chunk) => {
       is_error: false
     }) + "\\n");
   }
+});
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
+function writeArgRecordingClaudeCommand(argsPath: string): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `arg-recording-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+const fs = require("fs");
+fs.writeFileSync(${JSON.stringify(argsPath)}, JSON.stringify(process.argv.slice(2)), "utf8");
+process.stdin.resume();
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
+function writeClaudeAuthCommand(argsPath: string): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `auth-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+const fs = require("fs");
+fs.writeFileSync(${JSON.stringify(argsPath)}, JSON.stringify(process.argv.slice(2)), "utf8");
+process.stdout.write("Claude login URL: https://claude.example/login\\n");
+process.stderr.write("waiting for browser confirmation\\n");
+setTimeout(() => process.exit(0), 50);
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
+function writeQuotaErrorClaudeCommand(): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `quota-error-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let emitted = false;
+process.stdin.on("data", (chunk) => {
+  if (emitted || !chunk.trim()) return;
+  emitted = true;
+  process.stdout.write(JSON.stringify({
+    type: "result",
+    session_id: "fake-cli-session",
+    result: "Claude account reached the 5-hour usage limit. Try again later.",
+    error: {
+      status_code: 429,
+      type: "rate_limit_error",
+      message: "Claude account reached the 5-hour usage limit. Try again later.",
+      body: {
+        type: "error",
+        error: {
+          type: "claude_original_limit",
+          message: "Claude account reached the 5-hour usage limit. Try again later.",
+          upstream_code: "five_hour_limit"
+        }
+      }
+    },
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0
+    },
+    total_cost_usd: 0,
+    duration_ms: 5,
+    num_turns: 1,
+    is_error: true,
+    stop_reason: "error"
+  }) + "\\n");
+});
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
+function writeStderrExitClaudeCommand(stderrText: string, exitCode = 1): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `stderr-exit-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let started = false;
+process.stdin.on("data", (chunk) => {
+  if (started || !chunk.trim()) return;
+  started = true;
+  process.stderr.write(${JSON.stringify(stderrText)});
+  setTimeout(() => process.exit(${exitCode}), 25);
 });
 `,
     "utf-8"
@@ -809,10 +1053,18 @@ async function startTestServer(
   port: number,
   env: NodeJS.ProcessEnv
 ): Promise<ReturnType<typeof spawn>> {
+  const mergedEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...env,
+    CC_PROXY_PORT: String(port),
+  };
+  if (!mergedEnv.CC_PROXY_DATA_DIR) {
+    mergedEnv.CC_PROXY_DATA_DIR = makeIsolatedDataDir(`server-${port}`);
+  }
   const proc = spawn("node", [SERVER_SCRIPT], {
     cwd: PROJECT_ROOT,
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, ...env, CC_PROXY_PORT: String(port) },
+    env: mergedEnv,
   });
   const ready = await waitForServerAt(`http://localhost:${port}`);
   if (!ready) {
@@ -836,7 +1088,11 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
     serverProc = spawn("node", [SERVER_SCRIPT], {
       cwd: PROJECT_ROOT,
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, CC_PROXY_PORT: String(PORT) },
+      env: {
+        ...process.env,
+        CC_PROXY_PORT: String(PORT),
+        CC_PROXY_DATA_DIR: makeIsolatedDataDir("main-server"),
+      },
     });
     const ready = await waitForServer();
     if (!ready) {
@@ -864,6 +1120,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
           ...process.env,
           PORT: String(ZEABUR_PORT),
           CC_PROXY_PORT: undefined,
+          CC_PROXY_DATA_DIR: makeIsolatedDataDir("port-env"),
         },
       });
       try {
@@ -890,50 +1147,449 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       }
     });
 
-    it("adds CC_CLAUDE_MODEL to spawned Claude CLI args", () => {
-      const previousModel = process.env.CC_CLAUDE_MODEL;
-      process.env.CC_CLAUDE_MODEL = "claude-test-model";
-      try {
-        const args = resolveClaudeArgs();
-        assert.deepEqual(args.slice(-2), ["--model", "claude-test-model"]);
-      } finally {
-        if (previousModel === undefined) delete process.env.CC_CLAUDE_MODEL;
-        else process.env.CC_CLAUDE_MODEL = previousModel;
-      }
+    it("adds explicit model option to spawned Claude CLI args", () => {
+      const args = resolveClaudeArgs({ model: "claude-test-model" });
+      assert.deepEqual(args.slice(-2), ["--model", "claude-test-model"]);
     });
 
-    it("adds CC_PERMISSION_MODE to spawned Claude CLI args", () => {
-      const previousModel = process.env.CC_CLAUDE_MODEL;
-      const previousPermissionMode = process.env.CC_PERMISSION_MODE;
-      delete process.env.CC_CLAUDE_MODEL;
-      process.env.CC_PERMISSION_MODE = "acceptEdits";
-      try {
-        const args = resolveClaudeArgs();
-        assert.deepEqual(args.slice(-2), ["--permission-mode", "acceptEdits"]);
-      } finally {
-        if (previousModel === undefined) delete process.env.CC_CLAUDE_MODEL;
-        else process.env.CC_CLAUDE_MODEL = previousModel;
-        if (previousPermissionMode === undefined) delete process.env.CC_PERMISSION_MODE;
-        else process.env.CC_PERMISSION_MODE = previousPermissionMode;
-      }
+    it("adds explicit permission mode option to spawned Claude CLI args", () => {
+      const args = resolveClaudeArgs({ permissionMode: "acceptEdits" });
+      assert.deepEqual(args.slice(-2), ["--permission-mode", "acceptEdits"]);
     });
 
-    it("adds CC_CLAUDE_SETTING_SOURCES to spawned Claude CLI args", () => {
-      const previousSettingSources = process.env.CC_CLAUDE_SETTING_SOURCES;
-      process.env.CC_CLAUDE_SETTING_SOURCES = "project,local";
+    it("adds explicit setting sources option to spawned Claude CLI args", () => {
+      const args = resolveClaudeArgs({ settingSources: "project,local" });
+      assert.ok(
+        args.includes("--setting-sources"),
+        "Claude CLI args should include setting source override"
+      );
+      assert.equal(args[args.indexOf("--setting-sources") + 1], "project,local");
+    });
+
+    it("uses admin-managed config as the per-server Claude window concurrency limit", async () => {
+      const dataDir = makeIsolatedDataDir("admin-config-window-limit");
+      const proc = await startTestServer(ZEABUR_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+      });
       try {
-        const args = resolveClaudeArgs();
-        assert.ok(
-          args.includes("--setting-sources"),
-          "Claude CLI args should include setting source override"
+        const baseUrl = `http://localhost:${ZEABUR_PORT}`;
+        const adminToken = await bootstrapAdmin(baseUrl);
+        const clientKey = await createDownstreamKey(baseUrl, adminToken, "window-limit-client");
+        const clientAuth = { Authorization: `Bearer ${clientKey.value}` };
+
+        const unauthConfig = await httpGet(`${baseUrl}/admin/config`);
+        assert.equal(unauthConfig.status, 401);
+
+        const updated = await httpPut(
+          `${baseUrl}/admin/config`,
+          {
+            max_cli_windows: 1,
+            cli_idle_timeout_ms: 12_345,
+          },
+          { Authorization: `Bearer ${adminToken}` }
         );
-        assert.equal(args[args.indexOf("--setting-sources") + 1], "project,local");
+        assert.equal(updated.status, 200, updated.body);
+        const config = JSON.parse(updated.body).config;
+        assert.equal(config.max_cli_windows, 1);
+        assert.equal(config.cli_idle_timeout_ms, 12_345);
+
+        const first = await httpPost(`${baseUrl}/sessions`, {}, clientAuth);
+        assert.equal(first.status, 201, first.body);
+
+        const second = await httpPost(`${baseUrl}/sessions`, {}, clientAuth);
+        assert.equal(second.status, 503, second.body);
+        const body = JSON.parse(second.body);
+        assert.equal(body.limit, 1);
+        assert.match(body.error, /window concurrency reached/);
+
+        const firstBody = JSON.parse(first.body);
+        await httpDelete(`${baseUrl}/sessions/${firstBody.id}`, clientAuth);
       } finally {
-        if (previousSettingSources === undefined) {
-          delete process.env.CC_CLAUDE_SETTING_SOURCES;
-        } else {
-          process.env.CC_CLAUDE_SETTING_SOURCES = previousSettingSources;
+        proc.kill("SIGKILL");
+        await sleep(300);
+      }
+    });
+
+    it("uses admin-managed Claude CLI defaults when spawning new windows", async () => {
+      const dataDir = makeIsolatedDataDir("admin-claude-cli-defaults");
+      const argsPath = path.join(dataDir, "claude-args.json");
+      const fakeClaude = writeArgRecordingClaudeCommand(argsPath);
+      const proc = await startTestServer(ZEABUR_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const baseUrl = `http://localhost:${ZEABUR_PORT}`;
+        const adminToken = await bootstrapAdmin(baseUrl);
+        const clientKey = await createDownstreamKey(baseUrl, adminToken, "cli-default-client");
+        const clientAuth = { Authorization: `Bearer ${clientKey.value}` };
+
+        const updated = await httpPut(
+          `${baseUrl}/admin/config`,
+          {
+            claude_model: "admin-default-model",
+            claude_permission_mode: "acceptEdits",
+            claude_effort: "high",
+            claude_setting_sources: "project,local",
+          },
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(updated.status, 200, updated.body);
+        const config = JSON.parse(updated.body).config;
+        assert.equal(config.claude_model, "admin-default-model");
+        assert.equal(config.claude_permission_mode, "acceptEdits");
+        assert.equal(config.claude_effort, "high");
+        assert.equal(config.claude_setting_sources, "project,local");
+
+        const created = await httpPost(`${baseUrl}/sessions`, {}, clientAuth);
+        assert.equal(created.status, 201, created.body);
+        assert.equal(await waitForFile(argsPath), true, "Claude CLI args file was not written");
+
+        const args = JSON.parse(fs.readFileSync(argsPath, "utf-8"));
+        assert.ok(args.includes("--model"), `missing model args: ${args.join(" ")}`);
+        assert.equal(args[args.indexOf("--model") + 1], "admin-default-model");
+        assert.equal(args[args.indexOf("--permission-mode") + 1], "acceptEdits");
+        assert.equal(args[args.indexOf("--effort") + 1], "high");
+        assert.equal(args[args.indexOf("--setting-sources") + 1], "project,local");
+
+        const createdBody = JSON.parse(created.body);
+        await httpDelete(`${baseUrl}/sessions/${createdBody.id}`, clientAuth);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("lets admin-cleared Claude CLI defaults override environment fallbacks", async () => {
+      const dataDir = makeIsolatedDataDir("admin-clears-env-defaults");
+      const argsPath = path.join(dataDir, "claude-args.json");
+      const fakeClaude = writeArgRecordingClaudeCommand(argsPath);
+      const proc = await startTestServer(ZEABUR_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+        CLAUDE_COMMAND: fakeClaude,
+        CC_CLAUDE_MODEL: "env-model-should-not-run",
+        CC_PERMISSION_MODE: "env-permission-should-not-run",
+        CC_CLAUDE_SETTING_SOURCES: "env,local",
+      });
+      try {
+        const baseUrl = `http://localhost:${ZEABUR_PORT}`;
+        const adminToken = await bootstrapAdmin(baseUrl);
+        const clientKey = await createDownstreamKey(baseUrl, adminToken, "env-clear-client");
+        const clientAuth = { Authorization: `Bearer ${clientKey.value}` };
+
+        const initial = await httpGet(`${baseUrl}/admin/config`, {
+          Authorization: `Bearer ${adminToken}`,
+        });
+        assert.equal(initial.status, 200, initial.body);
+        assert.equal(JSON.parse(initial.body).config.claude_model, "env-model-should-not-run");
+
+        const updated = await httpPut(
+          `${baseUrl}/admin/config`,
+          {
+            claude_model: "",
+            claude_permission_mode: "",
+            claude_setting_sources: "",
+          },
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(updated.status, 200, updated.body);
+        const config = JSON.parse(updated.body).config;
+        assert.equal(config.claude_model, "");
+        assert.equal(config.claude_permission_mode, "");
+        assert.equal(config.claude_setting_sources, "");
+
+        const created = await httpPost(`${baseUrl}/sessions`, {}, clientAuth);
+        assert.equal(created.status, 201, created.body);
+        assert.equal(await waitForFile(argsPath), true, "Claude CLI args file was not written");
+
+        const args = JSON.parse(fs.readFileSync(argsPath, "utf-8"));
+        assert.equal(args.includes("--model"), false, `unexpected model args: ${args.join(" ")}`);
+        assert.equal(args.includes("--permission-mode"), false, `unexpected permission args: ${args.join(" ")}`);
+        assert.equal(args.includes("--setting-sources"), false, `unexpected setting args: ${args.join(" ")}`);
+
+        const createdBody = JSON.parse(created.body);
+        await httpDelete(`${baseUrl}/sessions/${createdBody.id}`, clientAuth);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("runs Claude account login from the admin backend and exposes auth logs", async () => {
+      const dataDir = makeIsolatedDataDir("admin-claude-auth-login");
+      const argsPath = path.join(dataDir, "claude-auth-args.json");
+      const fakeClaude = writeClaudeAuthCommand(argsPath);
+      const proc = await startTestServer(ZEABUR_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const baseUrl = `http://localhost:${ZEABUR_PORT}`;
+        const adminToken = await bootstrapAdmin(baseUrl);
+
+        const updated = await httpPut(
+          `${baseUrl}/admin/config`,
+          {
+            claude_command: fakeClaude,
+            claude_auth_login_args: "auth login --browser",
+          },
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(updated.status, 200, updated.body);
+        assert.equal(JSON.parse(updated.body).config.claude_auth_login_args, "auth login --browser");
+
+        const started = await httpPost(
+          `${baseUrl}/admin/claude-auth/login`,
+          {},
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(started.status, 202, started.body);
+        assert.equal(await waitForFile(argsPath), true, "Claude auth args file was not written");
+        const args = JSON.parse(fs.readFileSync(argsPath, "utf-8"));
+        assert.deepEqual(args, ["auth", "login", "--browser"]);
+
+        let authBody: any = null;
+        for (let i = 0; i < 20; i++) {
+          const auth = await httpGet(`${baseUrl}/admin/claude-auth`, {
+            Authorization: `Bearer ${adminToken}`,
+          });
+          assert.equal(auth.status, 200, auth.body);
+          authBody = JSON.parse(auth.body);
+          if (authBody.auth.status === "succeeded") break;
+          await sleep(50);
         }
+        assert.equal(authBody.auth.status, "succeeded");
+        assert.equal(authBody.auth.exit_code, 0);
+        assert.match(authBody.auth.log, /Claude login URL/);
+        assert.match(authBody.auth.log, /waiting for browser confirmation/);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("creates downstream API keys from the admin backend and records visible admin logs", async () => {
+      const dataDir = makeIsolatedDataDir("admin-api-keys-logs");
+      const proc = await startTestServer(ZEABUR_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+      });
+      try {
+        const baseUrl = `http://localhost:${ZEABUR_PORT}`;
+        const adminToken = await bootstrapAdmin(baseUrl);
+
+        const created = await httpPost(
+          `${baseUrl}/admin/api-keys`,
+          { name: "production-client" },
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(created.status, 201, created.body);
+        const createdBody = JSON.parse(created.body);
+        assert.match(createdBody.key.value, /^ccp_/);
+        assert.equal(createdBody.key.name, "production-client");
+
+        const authorized = await httpPost(
+          `${baseUrl}/v1/messages`,
+          { model: "claude-sonnet-4-6", max_tokens: 128, messages: [] },
+          { Authorization: `Bearer ${createdBody.key.value}` }
+        );
+        assert.equal(authorized.status, 400, authorized.body);
+
+        const logs = await httpGet(`${baseUrl}/admin/logs`, {
+          Authorization: `Bearer ${adminToken}`,
+        });
+        assert.equal(logs.status, 200, logs.body);
+        const logBody = JSON.parse(logs.body);
+        assert.ok(Array.isArray(logBody.logs), "logs should be an array");
+        assert.ok(
+          logBody.logs.some((entry: any) => entry.event === "admin.api_key.created"),
+          "admin logs should include API key creation"
+        );
+        assert.ok(
+          logBody.logs.some((entry: any) => entry.event === "proxy.request.completed"),
+          "admin logs should include downstream proxy request completion"
+        );
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+      }
+    });
+
+    it("disables and re-enables downstream API keys from the admin backend", async () => {
+      const dataDir = makeIsolatedDataDir("admin-api-key-disable");
+      const proc = await startTestServer(ZEABUR_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+      });
+      try {
+        const baseUrl = `http://localhost:${ZEABUR_PORT}`;
+        const adminToken = await bootstrapAdmin(baseUrl);
+
+        const created = await httpPost(
+          `${baseUrl}/admin/api-keys`,
+          { name: "customer-client" },
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(created.status, 201, created.body);
+        const createdBody = JSON.parse(created.body);
+
+        const initiallyAuthorized = await httpPost(
+          `${baseUrl}/v1/messages`,
+          { model: "claude-sonnet-4-6", max_tokens: 128, messages: [] },
+          { Authorization: `Bearer ${createdBody.key.value}` }
+        );
+        assert.equal(initiallyAuthorized.status, 400, initiallyAuthorized.body);
+
+        const disabled = await httpPatch(
+          `${baseUrl}/admin/api-keys/${createdBody.key.id}`,
+          { enabled: false },
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(disabled.status, 200, disabled.body);
+        assert.equal(JSON.parse(disabled.body).key.enabled, false);
+
+        const rejected = await httpPost(
+          `${baseUrl}/v1/messages`,
+          { model: "claude-sonnet-4-6", max_tokens: 128, messages: [] },
+          { Authorization: `Bearer ${createdBody.key.value}` }
+        );
+        assert.equal(rejected.status, 401, rejected.body);
+
+        const enabled = await httpPatch(
+          `${baseUrl}/admin/api-keys/${createdBody.key.id}`,
+          { enabled: true },
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(enabled.status, 200, enabled.body);
+        assert.equal(JSON.parse(enabled.body).key.enabled, true);
+
+        const authorizedAgain = await httpPost(
+          `${baseUrl}/v1/messages`,
+          { model: "claude-sonnet-4-6", max_tokens: 128, messages: [] },
+          { Authorization: `Bearer ${createdBody.key.value}` }
+        );
+        assert.equal(authorizedAgain.status, 400, authorizedAgain.body);
+
+        const logs = await httpGet(`${baseUrl}/admin/logs`, {
+          Authorization: `Bearer ${adminToken}`,
+        });
+        assert.equal(logs.status, 200, logs.body);
+        const logsBody = JSON.parse(logs.body);
+        assert.ok(
+          logsBody.logs.some((entry: any) => entry.event === "admin.api_key.updated"),
+          "admin logs should include API key status changes"
+        );
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+      }
+    });
+
+    it("deletes downstream API keys from the admin backend", async () => {
+      const dataDir = makeIsolatedDataDir("admin-api-key-delete");
+      const proc = await startTestServer(ZEABUR_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+      });
+      try {
+        const baseUrl = `http://localhost:${ZEABUR_PORT}`;
+        const adminToken = await bootstrapAdmin(baseUrl);
+
+        const created = await httpPost(
+          `${baseUrl}/admin/api-keys`,
+          { name: "deleted-client" },
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(created.status, 201, created.body);
+        const createdBody = JSON.parse(created.body);
+
+        const deleted = await httpDelete(
+          `${baseUrl}/admin/api-keys/${createdBody.key.id}`,
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(deleted.status, 200, deleted.body);
+        assert.equal(JSON.parse(deleted.body).key.id, createdBody.key.id);
+
+        const keys = await httpGet(`${baseUrl}/admin/api-keys`, {
+          Authorization: `Bearer ${adminToken}`,
+        });
+        assert.equal(keys.status, 200, keys.body);
+        assert.equal(
+          JSON.parse(keys.body).keys.some((key: any) => key.id === createdBody.key.id),
+          false
+        );
+
+        const rejected = await httpPost(
+          `${baseUrl}/v1/messages`,
+          { model: "claude-sonnet-4-6", max_tokens: 128, messages: [] },
+          { Authorization: `Bearer ${createdBody.key.value}` }
+        );
+        assert.equal(rejected.status, 401, rejected.body);
+
+        const logs = await httpGet(`${baseUrl}/admin/logs`, {
+          Authorization: `Bearer ${adminToken}`,
+        });
+        assert.equal(logs.status, 200, logs.body);
+        const logsBody = JSON.parse(logs.body);
+        assert.ok(
+          logsBody.logs.some((entry: any) => entry.event === "admin.api_key.deleted"),
+          "admin logs should include API key deletion"
+        );
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+      }
+    });
+
+    it("shows service runtime logs in the admin backend", async () => {
+      const dataDir = makeIsolatedDataDir("admin-service-runtime-logs");
+      const proc = await startTestServer(ZEABUR_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+      });
+      try {
+        const baseUrl = `http://localhost:${ZEABUR_PORT}`;
+        const adminToken = await bootstrapAdmin(baseUrl);
+
+        const hook = await httpPost(`${baseUrl}/hooks/pre-tool-use`, makePreToolUsePayload({
+          tool_name: "Read",
+          tool_input: { file_path: "demo.txt" },
+          cwd: TEST_WORKSPACE,
+        }));
+        assert.equal(hook.status, 200, hook.body);
+
+        const logs = await httpGet(`${baseUrl}/admin/logs`, {
+          Authorization: `Bearer ${adminToken}`,
+        });
+        assert.equal(logs.status, 200, logs.body);
+        const body = JSON.parse(logs.body);
+        assert.ok(
+          body.logs.some((entry: any) => entry.event === "service.log" && entry.message.includes("PreToolUse hook fired")),
+          "admin logs should include service runtime log entries"
+        );
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+      }
+    });
+
+    it("serves the administrator web console from /admin", async () => {
+      const dataDir = makeIsolatedDataDir("admin-web-console");
+      const proc = await startTestServer(ZEABUR_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+      });
+      try {
+        const res = await httpGet(`http://localhost:${ZEABUR_PORT}/admin`);
+        assert.equal(res.status, 200, res.body);
+        assert.match(String(res.headers["content-type"]), /^text\/html/);
+        assert.match(res.body, /cc-proxy-admin/);
+        assert.match(res.body, /5小时限额/);
+        assert.match(res.body, /本周限额/);
+        assert.match(res.body, /CLI 窗口/);
+        assert.match(res.body, /toggleKey/);
+        assert.match(res.body, /deleteKey/);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
       }
     });
 
@@ -1095,6 +1751,210 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       }
     });
 
+    it("passes Claude 429 quota errors downstream and marks the local account as cooling down", async () => {
+      const fakeClaude = writeQuotaErrorClaudeCommand();
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const before = Date.now();
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            messages: [{ role: "user", content: "hello" }],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 429, res.body);
+        const body = JSON.parse(res.body);
+        assert.equal(body.type, "error");
+        assert.equal(body.error.type, "claude_original_limit");
+        assert.equal(body.error.upstream_code, "five_hour_limit");
+        assert.match(body.error.message, /5-hour usage limit/);
+
+        const health = await httpGet(`http://localhost:${ANTHROPIC_PORT}/health`);
+        assert.equal(health.status, 200);
+        const healthBody = JSON.parse(health.body);
+        assert.equal(healthBody.account.status, "cooldown");
+        assert.equal(healthBody.account.last_error.status, 429);
+        assert.match(healthBody.account.last_error.message, /5-hour usage limit/);
+
+        const cooldownUntil = Date.parse(healthBody.account.cooldown_until);
+        assert.ok(Number.isFinite(cooldownUntil), "cooldown_until should be an ISO timestamp");
+        assert.equal(
+          healthBody.account.limits.five_hour.percent_remaining,
+          null,
+          "quota percentage must stay unknown unless Claude returns a real quota percentage"
+        );
+        assert.ok(
+          cooldownUntil - before >= 4.9 * 60 * 60 * 1000,
+          "cooldown should last about 5 hours"
+        );
+        assert.ok(
+          cooldownUntil - before <= 5.1 * 60 * 60 * 1000,
+          "cooldown should not exceed the expected 5-hour window"
+        );
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("surfaces raw Claude CLI stderr failures in downstream responses and admin account/log details", async () => {
+      const dataDir = makeIsolatedDataDir("admin-cli-stderr-failure");
+      const stderrText = "Claude account banned: upstream disabled this account\n";
+      const fakeClaude = writeStderrExitClaudeCommand(stderrText);
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const baseUrl = `http://localhost:${ANTHROPIC_PORT}`;
+        const adminToken = await bootstrapAdmin(baseUrl);
+        const clientKey = await createDownstreamKey(baseUrl, adminToken, "stderr-client");
+
+        const res = await httpPost(
+          `${baseUrl}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            messages: [{ role: "user", content: "hello" }],
+          },
+          { Authorization: `Bearer ${clientKey.value}` }
+        );
+        assert.equal(res.status, 502, res.body);
+        assert.match(res.body, /Claude account banned: upstream disabled this account/);
+
+        const account = await httpGet(`${baseUrl}/admin/account`, {
+          Authorization: `Bearer ${adminToken}`,
+        });
+        assert.equal(account.status, 200, account.body);
+        const accountBody = JSON.parse(account.body);
+        assert.equal(accountBody.account.status, "error");
+        assert.match(accountBody.account.last_error.message, /Claude account banned/);
+
+        const logs = await httpGet(`${baseUrl}/admin/logs`, {
+          Authorization: `Bearer ${adminToken}`,
+        });
+        assert.equal(logs.status, 200, logs.body);
+        const logsBody = JSON.parse(logs.body);
+        assert.ok(
+          logsBody.logs.some((entry: any) => JSON.stringify(entry).includes("Claude account banned")),
+          "admin logs should include raw Claude CLI stderr"
+        );
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("shows account usage spend and cache read rate in the admin account details", async () => {
+      const dataDir = makeIsolatedDataDir("admin-account-usage");
+      const fakeClaude = writeFakeClaudeCommand("USAGE_ACCOUNT_OK");
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const baseUrl = `http://localhost:${ANTHROPIC_PORT}`;
+        const adminToken = await bootstrapAdmin(baseUrl);
+        const clientKey = await createDownstreamKey(baseUrl, adminToken, "usage-client");
+
+        const res = await httpPost(
+          `${baseUrl}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            messages: [{ role: "user", content: "hello" }],
+          },
+          { Authorization: `Bearer ${clientKey.value}` }
+        );
+        assert.equal(res.status, 200, res.body);
+
+        const account = await httpGet(`${baseUrl}/admin/account`, {
+          Authorization: `Bearer ${adminToken}`,
+        });
+        assert.equal(account.status, 200, account.body);
+        const body = JSON.parse(account.body);
+        assert.equal(body.account.status, "ready");
+        assert.equal(body.account.usage.today.cost_usd, 0.0123);
+        assert.equal(body.account.usage.week.cost_usd, 0.0123);
+        assert.equal(body.account.usage.month.cost_usd, 0.0123);
+        assert.equal(body.account.usage.today.request_count, 1);
+        assert.equal(body.account.usage.today.input_tokens, 3);
+        assert.equal(body.account.usage.today.output_tokens, 4);
+        assert.equal(body.account.usage.today.cache_creation_input_tokens, 5);
+        assert.equal(body.account.usage.today.cache_read_input_tokens, 6);
+        assert.equal(body.account.usage.today.total_tokens, 18);
+        assert.equal(body.account.usage.today.average_duration_ms, 10);
+        assert.ok(
+          Math.abs(body.account.usage.today.cache_read_rate - 6 / 14) < 0.0001,
+          `unexpected cache read rate: ${body.account.usage.today.cache_read_rate}`
+        );
+        assert.equal(body.account.limits.five_hour.status, "ok");
+        assert.equal(body.account.limits.weekly.status, "ok");
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("shows active CLI windows with per-window usage in the admin backend", async () => {
+      const dataDir = makeIsolatedDataDir("admin-cli-window-usage");
+      const fakeClaude = writeFakeClaudeCommand("WINDOW_USAGE_OK");
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const baseUrl = `http://localhost:${ANTHROPIC_PORT}`;
+        const adminToken = await bootstrapAdmin(baseUrl);
+        const clientKey = await createDownstreamKey(baseUrl, adminToken, "window-usage-client");
+
+        const res = await httpPost(
+          `${baseUrl}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            messages: [{ role: "user", content: "hello" }],
+          },
+          {
+            Authorization: `Bearer ${clientKey.value}`,
+            "x-cc-keep-session": "true",
+          }
+        );
+        assert.equal(res.status, 200, res.body);
+
+        const windows = await httpGet(`${baseUrl}/admin/cli-windows`, {
+          Authorization: `Bearer ${adminToken}`,
+        });
+        assert.equal(windows.status, 200, windows.body);
+        const body = JSON.parse(windows.body);
+        assert.equal(body.limit, 10);
+        assert.equal(body.active, 1);
+        assert.equal(body.windows.length, 1);
+        assert.equal(body.windows[0].turns, 1);
+        assert.equal(body.windows[0].cli_session_id, "fake-cli-session");
+        assert.equal(body.windows[0].usage.total_tokens, 18);
+        assert.equal(body.windows[0].usage.cost_usd, 0.0123);
+        assert.equal(body.windows[0].usage.average_duration_ms, 10);
+        assert.ok(
+          Math.abs(body.windows[0].usage.cache_read_rate - 6 / 14) < 0.0001,
+          `unexpected cache read rate: ${body.windows[0].usage.cache_read_rate}`
+        );
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
     it("returns Anthropic SSE events for stream:true /v1/messages requests", async () => {
       const fakeClaude = writeFakeClaudeCommand("FAKE_STREAM_RESULT");
       const proc = await startTestServer(ANTHROPIC_PORT, {
@@ -1149,9 +2009,10 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.equal(res.headers["x-cc-cli-session-id"], "fake-cli-session");
         assert.match(res.body, /LIVE_DELTA_BEFORE_RESULT/);
         assert.ok(res.chunks.length > 0, "stream should produce chunks");
+        const lastChunk = res.chunks[res.chunks.length - 1];
         assert.ok(
-          res.chunks[0].atMs < 1000,
-          `first SSE chunk should arrive before delayed result, got ${res.chunks[0].atMs}ms`
+          lastChunk.atMs - res.chunks[0].atMs >= 500,
+          `first SSE chunk should arrive live before delayed result; first=${res.chunks[0].atMs}ms last=${lastChunk.atMs}ms`
         );
       } finally {
         proc.kill("SIGKILL");
@@ -1402,9 +2263,10 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.match(first.body, /toolu_frame_budget_001/);
         assert.match(first.body, /"stop_reason":"tool_use"/);
         assert.ok(first.chunks.length > 0, "stream should produce tool_use chunks");
+        const firstLastChunk = first.chunks[first.chunks.length - 1];
         assert.ok(
-          first.chunks[0].atMs < 1000,
-          `first tool_use SSE chunk should arrive live before delayed message_stop, got ${first.chunks[0].atMs}ms`
+          firstLastChunk.atMs - first.chunks[0].atMs >= 500,
+          `first tool_use SSE chunk should arrive live before delayed message_stop; first=${first.chunks[0].atMs}ms last=${firstLastChunk.atMs}ms`
         );
 
         const second = await httpPostChunked(

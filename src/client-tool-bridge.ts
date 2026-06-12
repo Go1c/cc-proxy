@@ -1,7 +1,7 @@
 import { randomUUID } from "crypto";
 import { ClaudeContentBlock, TurnUsage } from "./types";
 
-const CLIENT_TOOL_TIMEOUT_MS = parseInt(
+const DEFAULT_CLIENT_TOOL_TIMEOUT_MS = parseInt(
   process.env.CC_CLIENT_TOOL_TIMEOUT_MS || "300000",
   10
 );
@@ -57,7 +57,10 @@ export class ClientToolBridge {
   private toolUses: ToolUseBlock[] = [];
   private queuedResults = new Map<string, ClientToolResultBlock>();
 
-  constructor(readonly tools: ClientToolSpec[]) {}
+  constructor(
+    readonly tools: ClientToolSpec[],
+    private readonly timeoutMs = DEFAULT_CLIENT_TOOL_TIMEOUT_MS
+  ) {}
 
   normalizeToolUseName(name: string): string | null {
     if (this.tools.some((tool) => tool.name === name)) return name;
@@ -84,7 +87,7 @@ export class ClientToolBridge {
         timer: setTimeout(() => {
           this.calls = this.calls.filter((item) => item.id !== call.id);
           reject(new Error(`Timed out waiting for client tool_result: ${name}`));
-        }, CLIENT_TOOL_TIMEOUT_MS),
+        }, this.timeoutMs),
       };
       call.timer.unref?.();
       this.calls.push(call);

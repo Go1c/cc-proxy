@@ -9,15 +9,21 @@ import {
   ClaudeStreamMessage,
   HookPayload,
   PreToolUseOutput,
+  TurnErrorDetails,
   TurnResult,
 } from "./types";
-import { SessionManager, CapacityError, MAX_SESSIONS } from "./session-manager";
+import { SessionManager, CapacityError } from "./session-manager";
 import {
   ClientToolBridge,
   ClientToolSpec,
   ClientToolTurn,
   extractToolResults,
 } from "./client-tool-bridge";
+import { ClaudeProcessError, ClaudeRunnerOptions, resolveClaudeCommand } from "./runner";
+import { AccountState } from "./account-state";
+import { AuditLog } from "./audit-log";
+import { ControlPlane } from "./control-plane";
+import { ClaudeAuthJob, splitCommandArgs } from "./claude-auth-job";
 
 const PORT = parseInt(process.env.PORT || process.env.CC_PROXY_PORT || "3456", 10);
 const DOWNSTREAM_ROOT = path.resolve(
@@ -27,12 +33,18 @@ const SESSION_CWD = path.resolve(
   process.env.CC_SESSION_CWD || path.join(__dirname, "..", "test-workspace")
 );
 const TEMP_DIR = path.join(os.tmpdir(), "cc-proxy");
-const CLIENT_API_KEY = process.env.CC_PROXY_API_KEY || "";
+const DATA_DIR = path.resolve(process.env.CC_PROXY_DATA_DIR || path.join(process.cwd(), ".cc-proxy-data"));
+const LEGACY_CLIENT_API_KEY = process.env.CC_PROXY_API_KEY || "";
 
 // Ensure temp dir exists
 fs.mkdirSync(TEMP_DIR, { recursive: true });
+fs.mkdirSync(DATA_DIR, { recursive: true });
 
-const sessions = new SessionManager(SESSION_CWD);
+const controlPlane = new ControlPlane(path.join(DATA_DIR, "control-plane.json"));
+const auditLog = new AuditLog(path.join(DATA_DIR, "audit-log.json"));
+const accountState = new AccountState(path.join(DATA_DIR, "account-state.json"));
+const claudeAuthJob = new ClaudeAuthJob();
+const sessions = new SessionManager(SESSION_CWD, () => controlPlane.getConfig());
 
 interface PendingClientToolTurn {
   turn: ClientToolTurn;
@@ -52,6 +64,21 @@ function log(level: string, msg: string, data?: unknown) {
     ? `[${ts}] [${level}] ${msg} ${JSON.stringify(data).slice(0, 500)}`
     : `[${ts}] [${level}] ${msg}`;
   console.error(line);
+  try {
+    auditLog.record(normalizeAuditLevel(level), "service.log", msg, {
+      level,
+      ...(data === undefined ? {} : { data }),
+    });
+  } catch {
+    /* logging must never fail the request path */
+  }
+}
+
+function normalizeAuditLevel(level: string): "info" | "warn" | "error" {
+  const value = level.toLowerCase();
+  if (value === "warn" || value === "warning") return "warn";
+  if (value === "error") return "error";
+  return "info";
 }
 
 // ---- Downstream file reader ----
@@ -191,8 +218,16 @@ function requireClientAuth(
   responseShape: "anthropic" | "plain",
   requestId?: string
 ): boolean {
-  if (!CLIENT_API_KEY) return true;
-  if (extractClientApiKey(req) === CLIENT_API_KEY) return true;
+  const key = extractClientApiKey(req);
+  if (controlPlane.verifyApiKey(key)) return true;
+  if (LEGACY_CLIENT_API_KEY && key === LEGACY_CLIENT_API_KEY) return true;
+  if (
+    !controlPlane.configured &&
+    !LEGACY_CLIENT_API_KEY &&
+    controlPlane.listApiKeys().length === 0
+  ) {
+    return true;
+  }
 
   if (responseShape === "anthropic") {
     sendAnthropicError(
@@ -206,6 +241,144 @@ function requireClientAuth(
     sendJson(res, 401, { error: "unauthorized" });
   }
   return false;
+}
+
+function extractBearerToken(req: http.IncomingMessage): string {
+  const authorization = headerValue(req, "authorization");
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  return match?.[1] || "";
+}
+
+function requireAdminAuth(req: http.IncomingMessage, res: http.ServerResponse): boolean {
+  if (controlPlane.verifyAdminToken(extractBearerToken(req))) return true;
+  sendJson(res, 401, { error: "unauthorized" });
+  return false;
+}
+
+async function readJsonBody(req: http.IncomingMessage): Promise<any> {
+  const bodyText = await readBody(req);
+  if (!bodyText.trim()) return {};
+  return JSON.parse(bodyText);
+}
+
+function turnErrorStatus(result: TurnResult): number {
+  const status = result.error?.status_code;
+  if (typeof status === "number" && status >= 400 && status <= 599) return status;
+  return 502;
+}
+
+function turnErrorBody(result: TurnResult): unknown {
+  if (result.error && "body" in result.error && result.error.body !== undefined) {
+    return result.error.body;
+  }
+  return {
+    type: "error",
+    error: {
+      type: result.error?.type || "api_error",
+      message: result.error?.message || result.result || "Claude Code turn failed",
+    },
+  };
+}
+
+function sendTurnError(
+  res: http.ServerResponse,
+  result: TurnResult,
+  requestId: string
+): void {
+  sendJson(res, turnErrorStatus(result), turnErrorBody(result), { "request-id": requestId });
+}
+
+function recordTurnOutcome(result: TurnResult, route: string): void {
+  if (result.is_error) {
+    accountState.markError(result.error, controlPlane.getConfig().quota_cooldown_ms);
+    auditLog.record("warn", "account.error", "Claude account returned an error", {
+      route,
+      status: turnErrorStatus(result),
+      error: result.error || null,
+    });
+    return;
+  }
+  accountState.markSuccess(result.usage, result.duration_ms);
+}
+
+function isClaudeProcessFailure(err: unknown): err is ClaudeProcessError {
+  return err instanceof ClaudeProcessError;
+}
+
+function turnErrorFromException(err: unknown): TurnErrorDetails {
+  if (err instanceof ClaudeProcessError) {
+    const stderr = err.details.stderr?.trim();
+    return {
+      status_code: 502,
+      type: "api_error",
+      message: stderr || err.message || "Claude Code turn failed",
+      body: {
+        type: "error",
+        error: {
+          type: "api_error",
+          message: stderr || err.message || "Claude Code turn failed",
+        },
+      },
+    };
+  }
+  const message = err instanceof Error ? err.message : "request failed";
+  return {
+    status_code: 500,
+    type: "api_error",
+    message,
+  };
+}
+
+function recordClaudeExceptionOutcome(err: ClaudeProcessError, route: string): TurnErrorDetails {
+  const details = turnErrorFromException(err);
+  accountState.markError(details, controlPlane.getConfig().quota_cooldown_ms);
+  auditLog.record("error", "account.error", "Claude account returned an error", {
+    route,
+    status: details.status_code || 502,
+    error: details,
+    exit_code: err.details.exitCode ?? null,
+    signal: err.details.signal ?? null,
+    stderr: err.details.stderr || "",
+  });
+  return details;
+}
+
+function sendExceptionAsAnthropicError(
+  res: http.ServerResponse,
+  err: unknown,
+  requestId: string
+): void {
+  const details = turnErrorFromException(err);
+  const status = details.status_code || 500;
+  if (details.body !== undefined) {
+    sendJson(res, status, details.body, { "request-id": requestId });
+    return;
+  }
+  sendAnthropicError(
+    res,
+    status,
+    details.type || "api_error",
+    details.message || "request failed",
+    requestId
+  );
+}
+
+function claudeRunnerOptionsFromConfig(
+  overrides: ClaudeRunnerOptions = {}
+): ClaudeRunnerOptions {
+  const config = controlPlane.getConfig();
+  return {
+    command: overrides.command || config.claude_command || undefined,
+    model: overrides.model || config.claude_model || undefined,
+    permissionMode:
+      overrides.permissionMode || config.claude_permission_mode || undefined,
+    effort: overrides.effort || config.claude_effort || undefined,
+    settingSources:
+      overrides.settingSources || config.claude_setting_sources || undefined,
+    mcpConfig: overrides.mcpConfig,
+    strictMcpConfig: overrides.strictMcpConfig,
+    allowedTools: overrides.allowedTools,
+  };
 }
 
 function normalizeClientTools(tools: any): ClientToolSpec[] {
@@ -654,30 +827,29 @@ async function handleClientToolResultTurn(
 
   try {
     const result = await pending.finalPromise;
+    recordTurnOutcome(result, "/v1/messages");
     responseHeaders["x-cc-cli-session-id"] = result.session_id;
     if (result.is_error) {
+      auditLog.record("warn", "proxy.request.completed", "Proxy request completed", {
+        route: "/v1/messages",
+        status: turnErrorStatus(result),
+        request_id: requestId,
+      });
       if (res.headersSent) {
-        sendSseEvent(res, "error", {
-          type: "error",
-          error: {
-            type: "api_error",
-            message: result.result || "Claude Code turn failed",
-          },
-        });
+        sendSseEvent(res, "error", turnErrorBody(result));
         res.end();
       } else {
-        sendAnthropicError(
-          res,
-          502,
-          "api_error",
-          result.result || "Claude Code turn failed",
-          requestId
-        );
+        sendTurnError(res, result, requestId);
       }
       return;
     }
 
     const message = makeAnthropicMessage(pending.turn.model, result);
+    auditLog.record("info", "proxy.request.completed", "Proxy request completed", {
+      route: "/v1/messages",
+      status: 200,
+      request_id: requestId,
+    });
     if (body.stream === true) {
       writeAnthropicStreamHead(res, responseHeaders);
       if (!streamedLiveEvents) {
@@ -722,6 +894,12 @@ async function handleAnthropicMessages(
 
   const turnInputResult = buildTurnInputFromAnthropicMessages(body);
   if (!turnInputResult.ok) {
+    auditLog.record("info", "proxy.request.completed", "Proxy request completed", {
+      route: "/v1/messages",
+      status: turnInputResult.status || 400,
+      request_id: requestId,
+      error_type: turnInputResult.type || "invalid_request_error",
+    });
     sendAnthropicError(
       res,
       turnInputResult.status || 400,
@@ -763,10 +941,13 @@ async function handleAnthropicMessages(
       }
     } else {
       if (turnInputResult.tools.length > 0) {
-        bridge = new ClientToolBridge(turnInputResult.tools);
+        bridge = new ClientToolBridge(
+          turnInputResult.tools,
+          controlPlane.getConfig().client_tool_timeout_ms
+        );
         clientToolBridges.set(bridge.id, bridge);
       }
-      const info = sessions.create({
+      const info = sessions.create(claudeRunnerOptionsFromConfig({
         model: turnInputResult.model,
         effort: turnInputResult.effort,
         ...(bridge
@@ -776,7 +957,7 @@ async function handleAnthropicMessages(
               allowedTools: makeClientToolAllowedTools(turnInputResult.tools),
             }
           : {}),
-      });
+      }));
       sessionId = info.id;
       closeAfterTurn = !!bridge || !keepSession;
     }
@@ -865,30 +1046,29 @@ async function handleAnthropicMessages(
     }
 
     const result = await finalPromise;
+    recordTurnOutcome(result, "/v1/messages");
     responseHeaders["x-cc-cli-session-id"] = result.session_id;
     if (result.is_error) {
+      auditLog.record("warn", "proxy.request.completed", "Proxy request completed", {
+        route: "/v1/messages",
+        status: turnErrorStatus(result),
+        request_id: requestId,
+      });
       if (res.headersSent) {
-        sendSseEvent(res, "error", {
-          type: "error",
-          error: {
-            type: "api_error",
-            message: result.result || "Claude Code turn failed",
-          },
-        });
+        sendSseEvent(res, "error", turnErrorBody(result));
         res.end();
       } else {
-        sendAnthropicError(
-          res,
-          502,
-          "api_error",
-          result.result || "Claude Code turn failed",
-          requestId
-        );
+        sendTurnError(res, result, requestId);
       }
       return;
     }
 
     const message = makeAnthropicMessage(turnInputResult.model, result);
+    auditLog.record("info", "proxy.request.completed", "Proxy request completed", {
+      route: "/v1/messages",
+      status: 200,
+      request_id: requestId,
+    });
     if (body.stream === true) {
       writeAnthropicStreamHead(res, responseHeaders);
       if (!streamedLiveEvents) {
@@ -901,6 +1081,26 @@ async function handleAnthropicMessages(
   } catch (err: any) {
     if (err instanceof CapacityError) {
       sendAnthropicError(res, 503, "api_error", err.message, requestId);
+    } else if (isClaudeProcessFailure(err)) {
+      const details = recordClaudeExceptionOutcome(err, "/v1/messages");
+      if (res.headersSent) {
+        log("ERROR", "Anthropic messages request failed after stream started", {
+          error: details.message,
+          stderr: err.details.stderr || "",
+        });
+        sendSseEvent(res, "error", details.body || {
+          type: "error",
+          error: { type: details.type || "api_error", message: details.message || "request failed" },
+        });
+        res.end();
+      } else {
+        log("ERROR", "Anthropic messages request failed", {
+          error: details.message,
+          stderr: err.details.stderr || "",
+          exit_code: err.details.exitCode ?? null,
+        });
+        sendExceptionAsAnthropicError(res, err, requestId);
+      }
     } else if (res.headersSent) {
       log("ERROR", "Anthropic messages request failed after stream started", {
         error: err.message,
@@ -927,7 +1127,7 @@ async function handleAnthropicMessages(
 
 async function handleCreateSession(res: http.ServerResponse): Promise<void> {
   try {
-    const info = sessions.create();
+    const info = sessions.create(claudeRunnerOptionsFromConfig());
     log("INFO", "Session created", { id: info.id, total: sessions.size });
     sendJson(res, 201, info);
   } catch (err) {
@@ -959,6 +1159,11 @@ async function handleTurn(
   }
   try {
     const result = await sessions.turn(id, prompt);
+    recordTurnOutcome(result, "/sessions/:id/turn");
+    if (result.is_error) {
+      sendJson(res, turnErrorStatus(result), turnErrorBody(result));
+      return;
+    }
     sendJson(res, 200, result);
   } catch (err: any) {
     const msg = err.message || "turn failed";
@@ -966,11 +1171,243 @@ async function handleTurn(
       sendJson(res, 404, { error: msg });
     } else if (msg === "session is busy with another turn") {
       sendJson(res, 409, { error: msg });
+    } else if (isClaudeProcessFailure(err)) {
+      const details = recordClaudeExceptionOutcome(err, "/sessions/:id/turn");
+      log("ERROR", "Turn failed", {
+        id,
+        error: details.message,
+        stderr: err.details.stderr || "",
+        exit_code: err.details.exitCode ?? null,
+      });
+      sendJson(res, details.status_code || 502, details.body || {
+        type: "error",
+        error: {
+          type: details.type || "api_error",
+          message: details.message || "turn failed",
+        },
+      });
     } else {
       log("ERROR", "Turn failed", { id, error: msg });
       sendJson(res, 500, { error: msg });
     }
   }
+}
+
+async function handleAdminRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  pathname: string,
+  url: URL
+): Promise<boolean> {
+  if (req.method === "GET" && (pathname === "/admin" || pathname === "/admin/")) {
+    const adminHtmlPath = path.resolve(__dirname, "..", "public", "admin.html");
+    try {
+      const html = fs.readFileSync(adminHtmlPath, "utf-8");
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(html);
+    } catch (err: any) {
+      sendJson(res, 500, { error: err.message || "admin console unavailable" });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && pathname === "/admin/setup") {
+    if (controlPlane.configured) {
+      sendJson(res, 409, { error: "admin already configured" });
+      return true;
+    }
+    try {
+      const body = await readJsonBody(req);
+      const result = controlPlane.setupAdmin(String(body.username || ""), String(body.password || ""));
+      auditLog.record("info", "admin.setup", "Administrator account created", {
+        username: result.username,
+      });
+      sendJson(res, 201, result);
+    } catch (err: any) {
+      sendJson(res, 400, { error: err.message || "invalid setup request" });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && pathname === "/admin/auth/login") {
+    try {
+      const body = await readJsonBody(req);
+      const result = controlPlane.login(String(body.username || ""), String(body.password || ""));
+      if (!result) {
+        sendJson(res, 401, { error: "invalid credentials" });
+        return true;
+      }
+      auditLog.record("info", "admin.login", "Administrator logged in", {
+        username: result.username,
+      });
+      sendJson(res, 200, result);
+    } catch {
+      sendJson(res, 400, { error: "invalid login request" });
+    }
+    return true;
+  }
+
+  if (!pathname.startsWith("/admin/")) return false;
+  if (!requireAdminAuth(req, res)) return true;
+
+  if (req.method === "GET" && pathname === "/admin/config") {
+    sendJson(res, 200, { config: controlPlane.getConfig() });
+    return true;
+  }
+
+  if (req.method === "PUT" && pathname === "/admin/config") {
+    try {
+      const body = await readJsonBody(req);
+      const config = controlPlane.updateConfig(body || {});
+      auditLog.record("info", "admin.config.updated", "Runtime configuration updated", {
+        config,
+      });
+      sendJson(res, 200, { config });
+    } catch (err: any) {
+      sendJson(res, 400, { error: err.message || "invalid config request" });
+    }
+    return true;
+  }
+
+  if (req.method === "GET" && pathname === "/admin/api-keys") {
+    sendJson(res, 200, { keys: controlPlane.listApiKeys() });
+    return true;
+  }
+
+  if (req.method === "POST" && pathname === "/admin/api-keys") {
+    try {
+      const body = await readJsonBody(req);
+      const key = controlPlane.createApiKey(String(body.name || ""));
+      auditLog.record("info", "admin.api_key.created", "Downstream API key created", {
+        id: key.id,
+        name: key.name,
+        prefix: key.prefix,
+      });
+      sendJson(res, 201, { key });
+    } catch (err: any) {
+      sendJson(res, 400, { error: err.message || "invalid API key request" });
+    }
+    return true;
+  }
+
+  const apiKeyMatch = pathname.match(/^\/admin\/api-keys\/([^/]+)$/);
+  if (apiKeyMatch && req.method === "PATCH") {
+    try {
+      const body = await readJsonBody(req);
+      const patch: { name?: string; enabled?: boolean } = {};
+      if ("name" in body) patch.name = String(body.name || "");
+      if ("enabled" in body) patch.enabled = !!body.enabled;
+      const key = controlPlane.updateApiKey(decodeURIComponent(apiKeyMatch[1]), patch);
+      if (!key) {
+        sendJson(res, 404, { error: "API key not found" });
+        return true;
+      }
+      auditLog.record("info", "admin.api_key.updated", "Downstream API key updated", {
+        id: key.id,
+        name: key.name,
+        prefix: key.prefix,
+        enabled: key.enabled,
+      });
+      sendJson(res, 200, { key });
+    } catch (err: any) {
+      sendJson(res, 400, { error: err.message || "invalid API key update request" });
+    }
+    return true;
+  }
+
+  if (apiKeyMatch && req.method === "DELETE") {
+    const key = controlPlane.deleteApiKey(decodeURIComponent(apiKeyMatch[1]));
+    if (!key) {
+      sendJson(res, 404, { error: "API key not found" });
+      return true;
+    }
+    auditLog.record("info", "admin.api_key.deleted", "Downstream API key deleted", {
+      id: key.id,
+      name: key.name,
+      prefix: key.prefix,
+    });
+    sendJson(res, 200, { key });
+    return true;
+  }
+
+  if (req.method === "GET" && pathname === "/admin/logs") {
+    const limit = Number(url.searchParams.get("limit") || 100);
+    sendJson(res, 200, { logs: auditLog.list(Number.isFinite(limit) ? limit : 100) });
+    return true;
+  }
+
+  if (req.method === "GET" && pathname === "/admin/account") {
+    sendJson(res, 200, { account: accountState.snapshot() });
+    return true;
+  }
+
+  if (req.method === "GET" && pathname === "/admin/claude-auth") {
+    const config = controlPlane.getConfig();
+    sendJson(res, 200, {
+      auth: claudeAuthJob.snapshot(),
+      config: {
+        claude_command: config.claude_command,
+        claude_auth_login_args: config.claude_auth_login_args,
+        claude_auth_status_args: config.claude_auth_status_args,
+      },
+    });
+    return true;
+  }
+
+  if (req.method === "POST" && pathname === "/admin/claude-auth/login") {
+    try {
+      const config = controlPlane.getConfig();
+      const snapshot = claudeAuthJob.start({
+        command: resolveClaudeCommand(config.claude_command || undefined),
+        args: splitCommandArgs(config.claude_auth_login_args || "login"),
+        cwd: SESSION_CWD,
+      });
+      auditLog.record("info", "claude_auth.login.started", "Claude account login job started", {
+        command: snapshot.command,
+        args: snapshot.args,
+      });
+      sendJson(res, 202, { auth: snapshot });
+    } catch (err: any) {
+      sendJson(res, err.message?.includes("already running") ? 409 : 400, {
+        error: err.message || "failed to start Claude auth job",
+      });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && pathname === "/admin/claude-auth/check") {
+    try {
+      const config = controlPlane.getConfig();
+      const snapshot = claudeAuthJob.start({
+        command: resolveClaudeCommand(config.claude_command || undefined),
+        args: splitCommandArgs(config.claude_auth_status_args || "--version"),
+        cwd: SESSION_CWD,
+      });
+      auditLog.record("info", "claude_auth.check.started", "Claude account auth check job started", {
+        command: snapshot.command,
+        args: snapshot.args,
+      });
+      sendJson(res, 202, { auth: snapshot });
+    } catch (err: any) {
+      sendJson(res, err.message?.includes("already running") ? 409 : 400, {
+        error: err.message || "failed to start Claude auth check",
+      });
+    }
+    return true;
+  }
+
+  if (req.method === "GET" && pathname === "/admin/cli-windows") {
+    const config = controlPlane.getConfig();
+    sendJson(res, 200, {
+      limit: config.max_cli_windows,
+      active: sessions.size,
+      windows: sessions.list(),
+    });
+    return true;
+  }
+
+  sendJson(res, 404, { error: "admin route not found" });
+  return true;
 }
 
 // ---- HTTP server ----
@@ -980,13 +1417,20 @@ const server = http.createServer(async (req, res) => {
   const pathname = url.pathname;
 
   try {
+    if (await handleAdminRequest(req, res, pathname, url)) {
+      return;
+    }
+
     // Health check
     if (req.method === "GET" && pathname === "/health") {
+      const config = controlPlane.getConfig();
       sendJson(res, 200, {
         status: "ok",
         downstream_root: DOWNSTREAM_ROOT,
         sessions: sessions.size,
-        max_sessions: MAX_SESSIONS,
+        max_sessions: config.max_cli_windows,
+        max_cli_windows: config.max_cli_windows,
+        account: accountState.snapshot(),
       });
       return;
     }
@@ -1084,7 +1528,8 @@ server.listen(PORT, () => {
   log("INFO", `CC-Proxy server listening on port ${PORT}`);
   log("INFO", `Downstream project root: ${DOWNSTREAM_ROOT}`);
   log("INFO", `Session workspace: ${SESSION_CWD}`);
-  log("INFO", `Max sessions: ${MAX_SESSIONS}`);
+  log("INFO", `Data directory: ${DATA_DIR}`);
+  log("INFO", `Max CLI windows: ${controlPlane.getConfig().max_cli_windows}`);
   log("INFO", `Temp directory: ${TEMP_DIR}`);
 });
 
