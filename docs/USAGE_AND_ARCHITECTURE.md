@@ -483,6 +483,7 @@ Node HTTP server (dist/server.js)
 - Replaced prompt-emulated client-supplied `tools` with a real per-request MCP bridge.
 - Added Anthropic-style `tool_use` / `tool_result` continuation support.
 - Added live SSE forwarding for the first `tool_use` turn and for the resumed `tool_result` answer.
+- Filtered Claude Code internal tool discovery events such as `ToolSearch` out of the client-supplied tool bridge, so only tool names declared by the Anthropic client are exposed back as Anthropic `tool_use` blocks.
 - Added `CC_CLAUDE_MODEL=claude-sonnet-4-6` CLI model override.
 - Added `CC_PERMISSION_MODE=acceptEdits` CLI permission override.
 - Set production `CC_MAX_SESSIONS=10`.
@@ -505,6 +506,7 @@ Node HTTP server (dist/server.js)
 ## TODO
 
 - Verify exact `tool_choice` behavior against real Claude Code MCP calls and decide which Anthropic modes can be safely mapped.
+- Re-test client-supplied tools in production after Claude subscription quota resets. The latest run proved the proxy no longer leaks Claude Code internal `ToolSearch` as a client tool, but full tool execution/resume could not be completed because Claude Code returned a five-hour session-limit 429.
 - Add broader production integration coverage for multi-tool and tool error cases.
 - Improve Anthropic-compatible response headers and edge-case error shapes beyond request IDs.
 - Add per-user or per-client API keys instead of one shared `CC_PROXY_API_KEY`.
@@ -517,6 +519,7 @@ Node HTTP server (dist/server.js)
 
 - Very small image inputs can be rejected by the underlying Claude Code/API image processor. A normal 64x64 PNG image passed through `/v1/messages` and returned `Red` in production.
 - Claude Code reports high token counts because each Claude Code CLI request includes its own tool/runtime/system context. This is expected for the Claude Code OAuth path and is not the same as a minimal Anthropic API request.
+- Claude Code `usage.input_tokens` can look deceptively small while `cache_creation_input_tokens` and `cache_read_input_tokens` are large. For example, a real production tool validation turn reported `input_tokens=3`, `cache_creation_input_tokens=5818`, and `cache_read_input_tokens=17125`. Token auditing must include the cache fields, not just `input_tokens`.
 - `usage.total_cost_usd` is surfaced from Claude Code result events for visibility, but this deployment is authenticated by `CLAUDE_CODE_OAUTH_TOKEN`; do not add Anthropic API upstream credentials unless the billing model intentionally changes.
 - If local validation unexpectedly calls a remote proxy or custom Anthropic base URL, check user-level Claude Code settings and rerun with `CC_CLAUDE_SETTING_SOURCES=project,local` plus a valid `CLAUDE_CODE_OAUTH_TOKEN`.
 
@@ -576,7 +579,11 @@ Current production status as of 2026-06-12:
 
 ```text
 GET /health -> 200, max_sessions=10
-POST /v1/messages -> blocked until Claude Code OAuth is refreshed; current Pod token returns Claude CLI 401 Invalid bearer token
+CLAUDE_CODE_OAUTH_TOKEN -> refreshed with a 1-year Claude Code OAuth token; latest Pod reads token length 108 and prefix sk-ant-oat
+POST /v1/messages text -> 200, request-id and x-cc-cli-session-id present, LIVE_TEXT_OK returned
+POST /v1/messages stream:true -> 200, text/event-stream, request-id present, live content_block_delta events present, STREAM_REAL_OK returned
+POST /v1/messages long game-development context -> 200, LONG_GAME_CONTEXT_OK returned
+POST /v1/messages client-supplied tool first turn -> partially verified after internal ToolSearch filter deploy; current remaining verification is blocked by Claude Code five-hour session-limit 429 until reset
 ```
 
 Current local real-Claude validation status as of 2026-06-12:
@@ -584,7 +591,7 @@ Current local real-Claude validation status as of 2026-06-12:
 ```text
 Isolated local server with real Claude Code CLI starts and serves /health
 POST /v1/messages invalid messages -> 400, request-id header matches body request_id
-POST /v1/messages inference -> blocked by local Claude CLI 401 Invalid bearer token unless a fresh valid CLAUDE_CODE_OAUTH_TOKEN is supplied
+POST /v1/messages inference -> depends on local CLAUDE_CODE_OAUTH_TOKEN and Claude subscription session quota
 ```
 
 Previous verified production run on 2026-06-12 before the token refresh issue:
@@ -612,8 +619,8 @@ npm test
 Latest local result:
 
 ```text
-tests 73
-pass 73
+tests 74
+pass 74
 fail 0
 ```
 

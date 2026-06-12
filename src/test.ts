@@ -409,7 +409,10 @@ process.stdin.on("data", (chunk) => {
   return scriptPath;
 }
 
-function writeMcpToolCallingClaudeCommand(delayBeforeToolUseStopMs = 0): string {
+function writeMcpToolCallingClaudeCommand(
+  delayBeforeToolUseStopMs = 0,
+  includeInternalToolSearch = false
+): string {
   const scriptPath = path.join(TEST_WORKSPACE, `mcp-tool-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
   fs.writeFileSync(
     scriptPath,
@@ -498,6 +501,70 @@ async function runMcpToolCall() {
   }
 
   const toolInput = { platform: "switch" };
+  if (${includeInternalToolSearch}) {
+    emit({
+      type: "stream_event",
+      session_id: "fake-cli-session",
+      event: {
+        type: "message_start",
+        message: {
+          id: "msg_fake_tool_search",
+          type: "message",
+          role: "assistant",
+          model: "claude-sonnet-4-6",
+          content: [],
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: 8, output_tokens: 0 }
+        }
+      }
+    });
+    emit({
+      type: "stream_event",
+      session_id: "fake-cli-session",
+      event: {
+        type: "content_block_start",
+        index: 0,
+        content_block: {
+          type: "tool_use",
+          id: "toolu_internal_search_001",
+          name: "ToolSearch",
+          input: {}
+        }
+      }
+    });
+    emit({
+      type: "stream_event",
+      session_id: "fake-cli-session",
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: {
+          type: "input_json_delta",
+          partial_json: JSON.stringify({ query: "lookup_frame_budget", max_results: 5 })
+        }
+      }
+    });
+    emit({
+      type: "stream_event",
+      session_id: "fake-cli-session",
+      event: { type: "content_block_stop", index: 0 }
+    });
+    emit({
+      type: "stream_event",
+      session_id: "fake-cli-session",
+      event: {
+        type: "message_delta",
+        delta: { stop_reason: "tool_use", stop_sequence: null },
+        usage: { output_tokens: 10 }
+      }
+    });
+    emit({
+      type: "stream_event",
+      session_id: "fake-cli-session",
+      event: { type: "message_stop" }
+    });
+  }
   emit({
     type: "stream_event",
     session_id: "fake-cli-session",
@@ -1171,6 +1238,52 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
           secondBody.content[0].text,
           /CLIENT_TOOL_RESULT:Switch handheld budget/
         );
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("ignores Claude Code internal tool search before exposing client-supplied tools", async () => {
+      const fakeClaude = writeMcpToolCallingClaudeCommand(0, true);
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const first = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            tools: [
+              {
+                name: "lookup_frame_budget",
+                description: "Look up a game frame budget.",
+                input_schema: {
+                  type: "object",
+                  properties: { platform: { type: "string" } },
+                },
+              },
+            ],
+            messages: [
+              {
+                role: "user",
+                content:
+                  "Use lookup_frame_budget for a Nintendo Switch action RPG frame-budget check.",
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(first.status, 200, first.body);
+        const firstBody = JSON.parse(first.body);
+        assert.equal(firstBody.stop_reason, "tool_use");
+        assert.equal(firstBody.content.length, 1);
+        assert.equal(firstBody.content[0].type, "tool_use");
+        assert.equal(firstBody.content[0].name, "lookup_frame_budget");
+        assert.equal(firstBody.content[0].id, "toolu_frame_budget_001");
       } finally {
         proc.kill("SIGKILL");
         await sleep(300);

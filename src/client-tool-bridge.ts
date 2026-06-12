@@ -59,6 +59,20 @@ export class ClientToolBridge {
 
   constructor(readonly tools: ClientToolSpec[]) {}
 
+  normalizeToolUseName(name: string): string | null {
+    if (this.tools.some((tool) => tool.name === name)) return name;
+
+    const mcpPrefix = "mcp__cc_client_tools__";
+    if (name.startsWith(mcpPrefix)) {
+      const unprefixed = name.slice(mcpPrefix.length);
+      if (this.tools.some((tool) => tool.name === unprefixed)) {
+        return unprefixed;
+      }
+    }
+
+    return null;
+  }
+
   waitForCall(name: string, input: unknown): Promise<McpToolCallResult> {
     return new Promise((resolve, reject) => {
       const call: ClientToolCall = {
@@ -222,10 +236,12 @@ export class ClientToolTurn {
       if (!active) return;
       this.activeBlocks.delete(event.index);
       if (active.type === "tool_use" && active.id && active.name) {
+        const normalizedName = this.bridge.normalizeToolUseName(active.name);
+        if (!normalizedName) return;
         const block: ToolUseBlock = {
           type: "tool_use",
           id: active.id,
-          name: active.name,
+          name: normalizedName,
           input: parseToolInput(active.inputJson || ""),
         };
         this.content.push(block);
