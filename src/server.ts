@@ -1410,12 +1410,15 @@ async function handleAdminRequest(
   if (req.method === "POST" && pathname === "/admin/claude-auth/login") {
     try {
       const config = controlPlane.getConfig();
+      const loginArgs = splitCommandArgs(config.claude_auth_login_args);
+      const useDefaultSlashLogin = loginArgs.length === 0;
       const snapshot = claudeAuthJob.start({
         command: resolveClaudeCommand(config.claude_command || undefined),
-        args: splitCommandArgs(config.claude_auth_login_args),
+        args: loginArgs,
         cwd: SESSION_CWD,
         env: { HOME: CLAUDE_HOME_DIR },
-        pseudoTty: true,
+        pseudoTty: !useDefaultSlashLogin,
+        initialInput: useDefaultSlashLogin ? "/login" : undefined,
       });
       auditLog.record("info", "claude_auth.login.started", "Claude account login job started", {
         command: snapshot.command,

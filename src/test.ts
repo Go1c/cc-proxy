@@ -1593,7 +1593,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
           `${baseUrl}/admin/config`,
           {
             claude_command: fakeClaude,
-            claude_auth_login_args: "",
+            claude_auth_login_args: "setup-token",
           },
           { Authorization: `Bearer ${adminToken}` }
         );
@@ -1619,8 +1619,48 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.equal(authBody.auth.status, "succeeded");
         assert.match(authBody.auth.log, /TTY Claude login URL/);
         const recorded = JSON.parse(fs.readFileSync(argsPath, "utf-8"));
-        assert.deepEqual(recorded.args, []);
+        assert.deepEqual(recorded.args, ["setup-token"]);
         assert.equal(recorded.stdoutIsTTY, true);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("starts the default interactive Claude login without a pseudo terminal and sends /login", async () => {
+      const dataDir = makeIsolatedDataDir("admin-claude-auth-default-login");
+      const resultPath = path.join(dataDir, "claude-auth-default-login.json");
+      const fakeClaude = writeInteractiveClaudeAuthCommand(resultPath);
+      const proc = await startTestServer(ZEABUR_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const baseUrl = `http://localhost:${ZEABUR_PORT}`;
+        const adminToken = await bootstrapAdmin(baseUrl);
+
+        const updated = await httpPut(
+          `${baseUrl}/admin/config`,
+          {
+            claude_command: fakeClaude,
+            claude_auth_login_args: "",
+          },
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(updated.status, 200, updated.body);
+
+        const started = await httpPost(
+          `${baseUrl}/admin/claude-auth/login`,
+          {},
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(started.status, 202, started.body);
+
+        const recorded = await waitForJsonFile(resultPath);
+        assert.ok(recorded, "Claude auth default /login input file was not written");
+        assert.equal(recorded.input, "/login");
+        assert.equal(recorded.HOME, path.join(dataDir, "claude-home"));
       } finally {
         proc.kill("SIGKILL");
         await sleep(300);
@@ -1739,7 +1779,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
           `${baseUrl}/admin/config`,
           {
             claude_command: fakeClaude,
-            claude_auth_login_args: "login",
+            claude_auth_login_args: "manual-login",
           },
           { Authorization: `Bearer ${adminToken}` }
         );

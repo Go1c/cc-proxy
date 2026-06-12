@@ -20,6 +20,7 @@ export interface StartClaudeAuthJobOptions {
   cwd: string;
   env?: NodeJS.ProcessEnv;
   pseudoTty?: boolean;
+  initialInput?: string;
 }
 
 const MAX_LOG_CHARS = 64 * 1024;
@@ -71,6 +72,10 @@ export class ClaudeAuthJob {
         proc.onExit((event) => {
           this.finish(event.exitCode === 0 ? "succeeded" : "failed", event.exitCode, null);
         });
+        if (options.initialInput) {
+          proc.write(ensureTrailingNewline(options.initialInput));
+          this.appendLog("\n[admin input submitted]\n");
+        }
       } else {
         const proc = spawnChild(command, options.args, {
           cwd: options.cwd,
@@ -88,6 +93,10 @@ export class ClaudeAuthJob {
         proc.on("exit", (code, signal) => {
           this.finish(code === 0 ? "succeeded" : "failed", code, signal);
         });
+        if (options.initialInput) {
+          proc.stdin.write(ensureTrailingNewline(options.initialInput));
+          this.appendLog("\n[admin input submitted]\n");
+        }
       }
     } catch (err: any) {
       this.appendLog(`${err?.message || String(err)}\n`);
@@ -187,6 +196,10 @@ export class ClaudeAuthJob {
     this.proc = null;
     this.procKind = null;
   }
+}
+
+function ensureTrailingNewline(value: string): string {
+  return value.endsWith("\n") ? value : `${value}\n`;
 }
 
 export function splitCommandArgs(input: string): string[] {
