@@ -490,6 +490,30 @@ setTimeout(() => process.exit(0), 50);
   return scriptPath;
 }
 
+function writeTtyOnlyClaudeAuthCommand(argsPath: string): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `tty-auth-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+const fs = require("fs");
+fs.writeFileSync(${JSON.stringify(argsPath)}, JSON.stringify({
+  args: process.argv.slice(2),
+  stdoutIsTTY: !!process.stdout.isTTY,
+  stdinIsTTY: !!process.stdin.isTTY
+}), "utf8");
+if (process.stdout.isTTY) {
+  process.stdout.write("TTY Claude login URL: https://claude.example/tty-login\\n");
+  setTimeout(() => process.exit(0), 50);
+} else {
+  process.stdin.resume();
+}
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
 function writeInteractiveClaudeAuthCommand(resultPath: string): string {
   const scriptPath = path.join(TEST_WORKSPACE, `interactive-auth-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
   fs.writeFileSync(
@@ -1519,6 +1543,57 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.equal(authBody.auth.exit_code, 0);
         assert.match(authBody.auth.log, /Claude login URL/);
         assert.match(authBody.auth.log, /waiting for browser confirmation/);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("runs Claude account login in a pseudo terminal so interactive CLI output is visible", async () => {
+      const dataDir = makeIsolatedDataDir("admin-claude-auth-tty-login");
+      const argsPath = path.join(dataDir, "claude-auth-tty-args.json");
+      const fakeClaude = writeTtyOnlyClaudeAuthCommand(argsPath);
+      const proc = await startTestServer(ZEABUR_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const baseUrl = `http://localhost:${ZEABUR_PORT}`;
+        const adminToken = await bootstrapAdmin(baseUrl);
+
+        const updated = await httpPut(
+          `${baseUrl}/admin/config`,
+          {
+            claude_command: fakeClaude,
+            claude_auth_login_args: "setup-token",
+          },
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(updated.status, 200, updated.body);
+
+        const started = await httpPost(
+          `${baseUrl}/admin/claude-auth/login`,
+          {},
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(started.status, 202, started.body);
+
+        let authBody: any = null;
+        for (let i = 0; i < 20; i++) {
+          const auth = await httpGet(`${baseUrl}/admin/claude-auth`, {
+            Authorization: `Bearer ${adminToken}`,
+          });
+          assert.equal(auth.status, 200, auth.body);
+          authBody = JSON.parse(auth.body);
+          if (authBody.auth.status === "succeeded") break;
+          await sleep(50);
+        }
+        assert.equal(authBody.auth.status, "succeeded");
+        assert.match(authBody.auth.log, /TTY Claude login URL/);
+        const recorded = JSON.parse(fs.readFileSync(argsPath, "utf-8"));
+        assert.deepEqual(recorded.args, ["setup-token"]);
+        assert.equal(recorded.stdoutIsTTY, true);
       } finally {
         proc.kill("SIGKILL");
         await sleep(300);

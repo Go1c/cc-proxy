@@ -1,4 +1,5 @@
-import { spawn, ChildProcess } from "child_process";
+import { spawn as spawnChild, ChildProcess } from "child_process";
+import * as nodePty from "node-pty";
 
 export type ClaudeAuthJobStatus = "idle" | "running" | "succeeded" | "failed" | "cancelled";
 
@@ -18,12 +19,14 @@ export interface StartClaudeAuthJobOptions {
   args: string[];
   cwd: string;
   env?: NodeJS.ProcessEnv;
+  pseudoTty?: boolean;
 }
 
 const MAX_LOG_CHARS = 64 * 1024;
 
 export class ClaudeAuthJob {
-  private proc: ChildProcess | null = null;
+  private proc: ChildProcess | nodePty.IPty | null = null;
+  private procKind: "child" | "pty" | null = null;
   private state: ClaudeAuthJobSnapshot = {
     status: "idle",
     command: null,
@@ -53,21 +56,44 @@ export class ClaudeAuthJob {
       log: "",
     };
 
-    const proc = spawn(command, options.args, {
-      cwd: options.cwd,
-      stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, ...(options.env || {}) },
-    });
-    this.proc = proc;
-    proc.stdout?.on("data", (chunk) => this.appendLog(chunk));
-    proc.stderr?.on("data", (chunk) => this.appendLog(chunk));
-    proc.on("error", (err) => {
-      this.appendLog(`${err.message}\n`);
+    try {
+      if (options.pseudoTty && process.platform !== "win32") {
+        const proc = nodePty.spawn(command, options.args, {
+          name: "xterm-256color",
+          cols: 120,
+          rows: 30,
+          cwd: options.cwd,
+          env: { ...process.env, ...(options.env || {}) },
+        });
+        this.proc = proc;
+        this.procKind = "pty";
+        proc.onData((chunk) => this.appendLog(chunk));
+        proc.onExit((event) => {
+          this.finish(event.exitCode === 0 ? "succeeded" : "failed", event.exitCode, null);
+        });
+      } else {
+        const proc = spawnChild(command, options.args, {
+          cwd: options.cwd,
+          stdio: ["pipe", "pipe", "pipe"],
+          env: { ...process.env, ...(options.env || {}) },
+        });
+        this.proc = proc;
+        this.procKind = "child";
+        proc.stdout?.on("data", (chunk) => this.appendLog(chunk));
+        proc.stderr?.on("data", (chunk) => this.appendLog(chunk));
+        proc.on("error", (err) => {
+          this.appendLog(`${err.message}\n`);
+          this.finish("failed", null, null);
+        });
+        proc.on("exit", (code, signal) => {
+          this.finish(code === 0 ? "succeeded" : "failed", code, signal);
+        });
+      }
+    } catch (err: any) {
+      this.appendLog(`${err?.message || String(err)}\n`);
       this.finish("failed", null, null);
-    });
-    proc.on("exit", (code, signal) => {
-      this.finish(code === 0 ? "succeeded" : "failed", code, signal);
-    });
+      throw err;
+    }
     return this.snapshot();
   }
 
@@ -79,7 +105,12 @@ export class ClaudeAuthJob {
     if (!value.trim()) {
       throw new Error("Claude auth input is required");
     }
-    const stdin = this.proc.stdin;
+    if (this.procKind === "pty") {
+      (this.proc as nodePty.IPty).write(value.endsWith("\n") ? value : `${value}\n`);
+      this.appendLog("\n[admin input submitted]\n");
+      return this.snapshot();
+    }
+    const stdin = (this.proc as ChildProcess).stdin;
     if (!stdin || stdin.destroyed || !stdin.writable) {
       throw new Error("Claude auth job input is closed");
     }
@@ -93,19 +124,38 @@ export class ClaudeAuthJob {
       throw new Error("Claude auth job is not running");
     }
     const proc = this.proc;
+    const procKind = this.procKind;
     let exited = false;
-    proc.once("exit", () => {
-      exited = true;
-    });
+    let exitDisposable: nodePty.IDisposable | null = null;
+    if (procKind === "pty") {
+      exitDisposable = (proc as nodePty.IPty).onExit(() => {
+        exited = true;
+        exitDisposable?.dispose();
+      });
+    } else {
+      (proc as ChildProcess).once("exit", () => {
+        exited = true;
+      });
+    }
     this.appendLog("\n[admin cancelled auth job]\n");
     this.state.status = "cancelled";
     this.state.completed_at = new Date().toISOString();
     this.state.exit_code = null;
     this.state.signal = "SIGTERM";
     this.proc = null;
-    proc.kill("SIGTERM");
+    this.procKind = null;
+    if (procKind === "pty") {
+      (proc as nodePty.IPty).kill("SIGTERM");
+    } else {
+      (proc as ChildProcess).kill("SIGTERM");
+    }
     setTimeout(() => {
-      if (!exited) proc.kill("SIGKILL");
+      if (exited) return;
+      if (procKind === "pty") {
+        (proc as nodePty.IPty).kill("SIGKILL");
+      } else {
+        (proc as ChildProcess).kill("SIGKILL");
+      }
     }, 2000).unref();
     return this.snapshot();
   }
@@ -135,6 +185,7 @@ export class ClaudeAuthJob {
     this.state.exit_code = code;
     this.state.signal = signal;
     this.proc = null;
+    this.procKind = null;
   }
 }
 

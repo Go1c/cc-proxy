@@ -1394,6 +1394,7 @@ async function handleAdminRequest(
         args: splitCommandArgs(config.claude_auth_login_args || "setup-token"),
         cwd: SESSION_CWD,
         env: { HOME: CLAUDE_HOME_DIR },
+        pseudoTty: true,
       });
       auditLog.record("info", "claude_auth.login.started", "Claude account login job started", {
         command: snapshot.command,

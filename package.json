@@ -6,13 +6,15 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
+    "postinstall": "node scripts/ensure-node-pty-permissions.cjs",
     "validate": "tsc && node dist/validate.js",
     "test": "tsc && node --test dist/test.js",
     "test:verbose": "tsc && node --test --test-reporter=spec dist/test.js",
     "test:integration": "tsc && node dist/integration-test.js"
   },
   "dependencies": {
-    "@anthropic-ai/claude-code": "^2.1.173"
+    "@anthropic-ai/claude-code": "^2.1.173",
+    "node-pty": "^1.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
