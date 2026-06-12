@@ -93,13 +93,16 @@ https://你的域名/admin
 按顺序做：
 
 1. 创建管理员账号。
-2. 在 Runtime Config 里设置：
+2. 在运行配置里设置：
    - 最大 CLI 数量：例如 `1`、`2`、`3`，取决于你这个 Claude 账号能承受的并发。
    - CLI idle timeout：空闲多久自动回收窗口。
    - CLI turn timeout：单次请求最长等待时间。
    - Claude command：一般保持自动探测，或填 `/src/node_modules/@anthropic-ai/claude-code-linux-x64/claude`。
    - Claude model：需要固定模型时再填。
-3. 在 Claude Auth 区域执行登录或检查。
+3. 在 Claude 登录认证区域点击开始登录。
+   - 日志里出现 Claude 登录链接后，在浏览器打开链接完成授权。
+   - Claude 要求输入 code/callback 时，把返回内容粘贴到认证输入框，点击提交给 Claude CLI。
+   - 完成后点击检查认证确认登录态写入 `/data/cc-proxy/claude-home`。
 4. 在 API Keys 区域创建下游调用用的 key。
 
 ## 5. 下游调用
@@ -131,8 +134,8 @@ curl https://你的域名/v1/messages \
 
 `/admin` 里可以看：
 
-- Runtime Config：最大 CLI 数量、超时、Claude 命令、模型等。
-- Claude Auth：登录/检查任务输出。
+- 运行配置：最大 CLI 数量、超时、Claude 命令、模型等。
+- Claude 登录认证：登录/检查任务输出，以及提交登录 code/callback 给正在运行的 CLI。
 - Account：账号状态、最后错误、5 小时/周限制、今日/本周/本月 cost 和 token 统计、缓存读取率、平均耗时。
 - CLI Windows：当前活跃 Claude CLI 窗口、每个窗口的 session/usage/error。
 - API Keys：创建、禁用、删除下游 key。

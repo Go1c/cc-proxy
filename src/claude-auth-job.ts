@@ -55,7 +55,7 @@ export class ClaudeAuthJob {
 
     const proc = spawn(command, options.args, {
       cwd: options.cwd,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, ...(options.env || {}) },
     });
     this.proc = proc;
@@ -68,6 +68,23 @@ export class ClaudeAuthJob {
     proc.on("exit", (code, signal) => {
       this.finish(code === 0 ? "succeeded" : "failed", code, signal);
     });
+    return this.snapshot();
+  }
+
+  submitInput(input: string): ClaudeAuthJobSnapshot {
+    if (!this.proc || this.state.status !== "running") {
+      throw new Error("Claude auth job is not running");
+    }
+    const value = String(input || "");
+    if (!value.trim()) {
+      throw new Error("Claude auth input is required");
+    }
+    const stdin = this.proc.stdin;
+    if (!stdin || stdin.destroyed || !stdin.writable) {
+      throw new Error("Claude auth job input is closed");
+    }
+    stdin.write(value.endsWith("\n") ? value : `${value}\n`);
+    this.appendLog("\n[admin input submitted]\n");
     return this.snapshot();
   }
 

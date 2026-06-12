@@ -1401,6 +1401,22 @@ async function handleAdminRequest(
     return true;
   }
 
+  if (req.method === "POST" && pathname === "/admin/claude-auth/input") {
+    try {
+      const body = await readJsonBody(req);
+      const snapshot = claudeAuthJob.submitInput(String(body.input || ""));
+      auditLog.record("info", "claude_auth.input.submitted", "Claude account auth input submitted", {
+        status: snapshot.status,
+      });
+      sendJson(res, 200, { auth: snapshot });
+    } catch (err: any) {
+      sendJson(res, err.message?.includes("not running") ? 409 : 400, {
+        error: err.message || "failed to submit Claude auth input",
+      });
+    }
+    return true;
+  }
+
   if (req.method === "GET" && pathname === "/admin/cli-windows") {
     const config = controlPlane.getConfig();
     sendJson(res, 200, {
@@ -1435,7 +1451,6 @@ const server = http.createServer(async (req, res) => {
         sessions: sessions.size,
         max_sessions: config.max_cli_windows,
         max_cli_windows: config.max_cli_windows,
-        account: accountState.snapshot(),
       });
       return;
     }

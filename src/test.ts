@@ -488,6 +488,33 @@ setTimeout(() => process.exit(0), 50);
   return scriptPath;
 }
 
+function writeInteractiveClaudeAuthCommand(resultPath: string): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `interactive-auth-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+const fs = require("fs");
+process.stdin.setEncoding("utf8");
+process.stdout.write("Claude login URL: https://claude.example/login\\n");
+process.stderr.write("Paste authorization code to continue\\n");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  if (!buffer.includes("\\n")) return;
+  fs.writeFileSync(${JSON.stringify(resultPath)}, JSON.stringify({
+    input: buffer.trim(),
+    HOME: process.env.HOME || ""
+  }), "utf8");
+  process.stdout.write("login complete\\n");
+  process.exit(0);
+});
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
 function writeQuotaErrorClaudeCommand(): string {
   const scriptPath = path.join(TEST_WORKSPACE, `quota-error-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
   fs.writeFileSync(
@@ -1485,6 +1512,66 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       }
     });
 
+    it("forwards admin-submitted Claude auth input to the running login process", async () => {
+      const dataDir = makeIsolatedDataDir("claude-auth-input");
+      const resultPath = path.join(dataDir, "claude-auth-input.json");
+      const fakeClaude = writeInteractiveClaudeAuthCommand(resultPath);
+      const proc = await startTestServer(ZEABUR_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const baseUrl = `http://localhost:${ZEABUR_PORT}`;
+        const adminToken = await bootstrapAdmin(baseUrl);
+
+        const updated = await httpPut(
+          `${baseUrl}/admin/config`,
+          {
+            claude_command: fakeClaude,
+            claude_auth_login_args: "login",
+          },
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(updated.status, 200, updated.body);
+
+        const started = await httpPost(
+          `${baseUrl}/admin/claude-auth/login`,
+          {},
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(started.status, 202, started.body);
+
+        const inputRes = await httpPost(
+          `${baseUrl}/admin/claude-auth/input`,
+          { input: "code-123#state-456" },
+          { Authorization: `Bearer ${adminToken}` }
+        );
+        assert.equal(inputRes.status, 200, inputRes.body);
+
+        const recorded = await waitForJsonFile(resultPath);
+        assert.ok(recorded, "Claude auth input file was not written");
+        assert.equal(recorded.input, "code-123#state-456");
+        assert.equal(recorded.HOME, path.join(dataDir, "claude-home"));
+
+        let authBody: any = null;
+        for (let i = 0; i < 20; i++) {
+          const auth = await httpGet(`${baseUrl}/admin/claude-auth`, {
+            Authorization: `Bearer ${adminToken}`,
+          });
+          assert.equal(auth.status, 200, auth.body);
+          authBody = JSON.parse(auth.body);
+          if (authBody.auth.status === "succeeded") break;
+          await sleep(50);
+        }
+        assert.equal(authBody.auth.status, "succeeded");
+        assert.match(authBody.auth.log, /login complete/);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
     it("creates downstream API keys from the admin backend and records visible admin logs", async () => {
       const dataDir = makeIsolatedDataDir("admin-api-keys-logs");
       const proc = await startTestServer(ZEABUR_PORT, {
@@ -1701,6 +1788,10 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.match(res.body, /CLI 窗口/);
         assert.match(res.body, /toggleKey/);
         assert.match(res.body, /deleteKey/);
+        assert.match(res.body, /claudeAuthInput/);
+        assert.match(res.body, /\/admin\/claude-auth\/input/);
+        assert.match(res.body, /copyCreatedKeyButton/);
+        assert.match(res.body, /logLevelFilter/);
       } finally {
         proc.kill("SIGKILL");
         await sleep(300);
@@ -1721,6 +1812,15 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       const body = JSON.parse(res.body);
       assert.equal(body.status, "ok");
       assert.ok(body.downstream_root, "should report downstream_root");
+    });
+
+    it("GET /health does not expose admin-only account details", async () => {
+      const res = await httpGet(`${BASE_URL}/health`);
+      assert.equal(res.status, 200);
+      const body = JSON.parse(res.body);
+      assert.equal("account" in body, false);
+      assert.equal("usage" in body, false);
+      assert.equal("last_error" in body, false);
     });
 
     it("GET /health reports correct downstream_root", async () => {
@@ -1868,19 +1968,21 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
     it("passes Claude 429 quota errors downstream and marks the local account as cooling down", async () => {
       const fakeClaude = writeQuotaErrorClaudeCommand();
       const proc = await startTestServer(ANTHROPIC_PORT, {
-        CC_PROXY_API_KEY: "test-secret",
         CLAUDE_COMMAND: fakeClaude,
       });
       try {
+        const baseUrl = `http://localhost:${ANTHROPIC_PORT}`;
+        const adminToken = await bootstrapAdmin(baseUrl);
+        const clientKey = await createDownstreamKey(baseUrl, adminToken, "quota-client");
         const before = Date.now();
         const res = await httpPost(
-          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          `${baseUrl}/v1/messages`,
           {
             model: "claude-sonnet-4-6",
             max_tokens: 128,
             messages: [{ role: "user", content: "hello" }],
           },
-          { Authorization: "Bearer test-secret" }
+          { Authorization: `Bearer ${clientKey.value}` }
         );
         assert.equal(res.status, 429, res.body);
         const body = JSON.parse(res.body);
@@ -1889,17 +1991,24 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.equal(body.error.upstream_code, "five_hour_limit");
         assert.match(body.error.message, /5-hour usage limit/);
 
-        const health = await httpGet(`http://localhost:${ANTHROPIC_PORT}/health`);
+        const health = await httpGet(`${baseUrl}/health`);
         assert.equal(health.status, 200);
         const healthBody = JSON.parse(health.body);
-        assert.equal(healthBody.account.status, "cooldown");
-        assert.equal(healthBody.account.last_error.status, 429);
-        assert.match(healthBody.account.last_error.message, /5-hour usage limit/);
+        assert.equal("account" in healthBody, false);
 
-        const cooldownUntil = Date.parse(healthBody.account.cooldown_until);
+        const accountRes = await httpGet(`${baseUrl}/admin/account`, {
+          Authorization: `Bearer ${adminToken}`,
+        });
+        assert.equal(accountRes.status, 200, accountRes.body);
+        const account = JSON.parse(accountRes.body).account;
+        assert.equal(account.status, "cooldown");
+        assert.equal(account.last_error.status, 429);
+        assert.match(account.last_error.message, /5-hour usage limit/);
+
+        const cooldownUntil = Date.parse(account.cooldown_until);
         assert.ok(Number.isFinite(cooldownUntil), "cooldown_until should be an ISO timestamp");
         assert.equal(
-          healthBody.account.limits.five_hour.percent_remaining,
+          account.limits.five_hour.percent_remaining,
           null,
           "quota percentage must stay unknown unless Claude returns a real quota percentage"
         );

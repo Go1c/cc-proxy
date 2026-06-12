@@ -7,326 +7,793 @@
   <style>
     :root {
       color-scheme: light;
-      --bg: #f7f8fb;
+      --bg: #f4f6f9;
       --panel: #ffffff;
-      --ink: #1b2330;
+      --panel-soft: #f9fafb;
+      --ink: #172033;
       --muted: #667085;
-      --line: #d8dee8;
-      --brand: #1664d9;
-      --danger: #b42318;
+      --line: #d7dde7;
+      --brand: #155eef;
+      --brand-soft: #eaf1ff;
       --ok: #067647;
+      --ok-soft: #dcfae6;
+      --warn: #b54708;
+      --warn-soft: #fff4d6;
+      --danger: #b42318;
+      --danger-soft: #fee4e2;
+      --code: #111827;
     }
+
     * { box-sizing: border-box; }
+
     body {
       margin: 0;
       background: var(--bg);
       color: var(--ink);
       font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
-    header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      padding: 18px 24px;
-      border-bottom: 1px solid var(--line);
-      background: var(--panel);
-    }
-    h1, h2 {
-      margin: 0;
+
+    button,
+    input,
+    textarea,
+    select {
+      font: inherit;
       letter-spacing: 0;
     }
-    h1 { font-size: 20px; }
-    h2 { font-size: 15px; }
-    main {
-      width: min(1180px, calc(100vw - 32px));
-      margin: 20px auto 40px;
-      display: grid;
-      grid-template-columns: 320px 1fr;
-      gap: 16px;
+
+    button {
+      min-height: 36px;
+      border: 1px solid var(--brand);
+      border-radius: 6px;
+      padding: 8px 12px;
+      background: var(--brand);
+      color: #fff;
+      font-weight: 700;
+      cursor: pointer;
+      white-space: nowrap;
     }
-    section {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 16px;
+
+    button:hover { filter: brightness(0.96); }
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.55;
+      filter: none;
     }
-    .stack { display: grid; gap: 16px; }
-    .form { display: grid; gap: 10px; margin-top: 14px; }
-    label {
-      display: grid;
-      gap: 6px;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 600;
+
+    button.secondary {
+      background: #fff;
+      color: var(--ink);
+      border-color: var(--line);
     }
-    input {
+
+    button.ghost {
+      background: var(--panel-soft);
+      color: var(--ink);
+      border-color: var(--line);
+    }
+
+    button.danger {
+      background: var(--danger-soft);
+      color: var(--danger);
+      border-color: #fda29b;
+    }
+
+    input,
+    textarea,
+    select {
       width: 100%;
       border: 1px solid var(--line);
       border-radius: 6px;
       padding: 9px 10px;
       color: var(--ink);
       background: #fff;
-      font: inherit;
+      outline: none;
     }
-    button {
-      border: 0;
-      border-radius: 6px;
-      padding: 9px 12px;
-      background: var(--brand);
-      color: #fff;
-      font-weight: 700;
-      cursor: pointer;
+
+    input:focus,
+    textarea:focus,
+    select:focus {
+      border-color: var(--brand);
+      box-shadow: 0 0 0 3px var(--brand-soft);
     }
-    button.secondary {
-      background: #edf2f7;
-      color: var(--ink);
-      border: 1px solid var(--line);
+
+    textarea {
+      min-height: 82px;
+      resize: vertical;
     }
-    button.danger {
-      background: #fee4e2;
-      color: var(--danger);
-      border: 1px solid #fda29b;
+
+    h1,
+    h2,
+    h3,
+    p {
+      margin: 0;
+      letter-spacing: 0;
     }
-    .actions {
+
+    h1 { font-size: 20px; line-height: 1.25; }
+    h2 { font-size: 15px; line-height: 1.3; }
+    h3 { font-size: 13px; line-height: 1.3; }
+
+    .app-header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.96);
+      backdrop-filter: blur(10px);
+    }
+
+    .header-inner {
+      width: min(1240px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 14px 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .title-block {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }
+
+    .title-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .title-row h1 {
+      overflow-wrap: anywhere;
+    }
+
+    .header-actions,
+    .actions,
+    .inline-actions {
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
-    }
-    .row {
-      display: flex;
       align-items: center;
-      justify-content: space-between;
-      gap: 10px;
     }
-    .status {
+
+    .shell {
+      width: min(1240px, calc(100vw - 32px));
+      margin: 18px auto 40px;
+      display: grid;
+      gap: 16px;
+    }
+
+    .quick-nav {
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      padding-bottom: 2px;
+    }
+
+    .quick-nav a {
       display: inline-flex;
       align-items: center;
-      min-height: 24px;
-      padding: 3px 8px;
-      border-radius: 999px;
-      background: #edf2f7;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 700;
-    }
-    .status.ready { color: var(--ok); background: #dcfae6; }
-    .status.cooldown, .status.error { color: var(--danger); background: #fee4e2; }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      margin-top: 12px;
-    }
-    th, td {
-      border-bottom: 1px solid var(--line);
-      padding: 9px 6px;
-      text-align: left;
-      vertical-align: top;
-      overflow-wrap: anywhere;
-    }
-    th {
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 700;
-    }
-    pre {
-      max-height: 260px;
-      overflow: auto;
-      margin: 12px 0 0;
-      padding: 10px;
+      min-height: 34px;
+      padding: 7px 10px;
+      border: 1px solid var(--line);
       border-radius: 6px;
-      background: #101828;
-      color: #f9fafb;
-      font-size: 12px;
-      white-space: pre-wrap;
+      color: var(--ink);
+      background: #fff;
+      text-decoration: none;
+      font-weight: 700;
+      white-space: nowrap;
     }
-    .notice {
-      margin-top: 10px;
-      color: var(--muted);
-      min-height: 20px;
+
+    .quick-nav a:hover {
+      border-color: var(--brand);
+      color: var(--brand);
     }
-    .metric-grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
-      margin-top: 14px;
-    }
-    .metric {
+
+    .panel {
+      background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
-      padding: 10px;
-      background: #fbfcfe;
+      padding: 16px;
       min-width: 0;
     }
+
+    .panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    .panel-title {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }
+
+    .panel-title p,
+    .subtle,
+    .notice {
+      color: var(--muted);
+    }
+
+    .notice {
+      min-height: 20px;
+      overflow-wrap: anywhere;
+    }
+
+    .notice.error { color: var(--danger); }
+    .notice.ok { color: var(--ok); }
+
+    .overview-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .metric,
+    .inline-panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-soft);
+      padding: 12px;
+      min-width: 0;
+    }
+
     .metric span,
     .metric small {
       display: block;
       color: var(--muted);
       overflow-wrap: anywhere;
     }
+
     .metric span {
       font-size: 12px;
       font-weight: 700;
     }
+
     .metric strong {
       display: block;
-      margin-top: 4px;
-      font-size: 18px;
+      margin-top: 6px;
+      font-size: 19px;
       line-height: 1.2;
       overflow-wrap: anywhere;
     }
-    .metric small { margin-top: 4px; }
+
+    .metric small { margin-top: 5px; }
+
+    .content-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.08fr) minmax(340px, 0.92fr);
+      gap: 16px;
+      align-items: start;
+    }
+
+    .stack {
+      display: grid;
+      gap: 16px;
+      min-width: 0;
+    }
+
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }
+
+    .form-grid.one { grid-template-columns: 1fr; }
+
+    label {
+      display: grid;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      min-width: 0;
+    }
+
+    .status {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 24px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: #eef2f6;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      overflow-wrap: anywhere;
+      text-align: center;
+    }
+
+    .status.ready,
+    .status.succeeded,
+    .status.active {
+      color: var(--ok);
+      background: var(--ok-soft);
+    }
+
+    .status.running,
+    .status.cooldown,
+    .status.warning {
+      color: var(--warn);
+      background: var(--warn-soft);
+    }
+
+    .status.error,
+    .status.failed,
+    .status.closed,
+    .status.locked {
+      color: var(--danger);
+      background: var(--danger-soft);
+    }
+
+    .table-wrap {
+      width: 100%;
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid var(--line);
+      padding: 9px 7px;
+      text-align: left;
+      vertical-align: top;
+      overflow-wrap: anywhere;
+    }
+
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    pre,
+    .log-box {
+      max-height: 300px;
+      overflow: auto;
+      margin: 12px 0 0;
+      padding: 11px;
+      border-radius: 8px;
+      background: var(--code);
+      color: #f9fafb;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .created-key {
+      display: grid;
+      gap: 8px;
+    }
+
+    .key-output {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: start;
+    }
+
+    .key-output pre {
+      margin: 0;
+      min-height: 40px;
+      max-height: 120px;
+    }
+
     .empty {
       color: var(--muted);
       text-align: center;
     }
-    @media (max-width: 820px) {
-      main { grid-template-columns: 1fr; }
-      header { align-items: flex-start; flex-direction: column; }
-      .metric-grid { grid-template-columns: 1fr; }
+
+    details {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 10px 12px;
+      margin-top: 12px;
+    }
+
+    summary {
+      cursor: pointer;
+      color: var(--ink);
+      font-weight: 800;
+    }
+
+    .auth-log-actions {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+      margin-top: 12px;
+    }
+
+    .auth-link {
+      min-width: 0;
+      color: var(--brand);
+      overflow-wrap: anywhere;
+    }
+
+    .hidden { display: none !important; }
+
+    @media (max-width: 1100px) {
+      .overview-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .content-grid { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 760px) {
+      .header-inner {
+        grid-template-columns: 1fr;
+        align-items: stretch;
+      }
+
+      .header-actions,
+      .actions,
+      .inline-actions {
+        width: 100%;
+      }
+
+      .header-actions button,
+      .actions button {
+        flex: 1 1 auto;
+      }
+
+      .overview-grid,
+      .form-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .panel-header {
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      .key-output,
+      .auth-log-actions {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
 <body>
-  <header>
-    <div>
-      <h1 id="cc-proxy-admin">CC Proxy Admin</h1>
-      <div class="notice" id="sessionState">未登录</div>
+  <header class="app-header">
+    <div class="header-inner">
+      <div class="title-block">
+        <div class="title-row">
+          <h1 id="cc-proxy-admin">CC Proxy Admin</h1>
+          <span class="status locked" id="authState">locked</span>
+        </div>
+        <div class="notice" id="sessionState">未登录</div>
+      </div>
+      <div class="header-actions">
+        <button class="secondary" id="refreshButton" type="button">刷新</button>
+        <button class="ghost" id="logoutButton" type="button">退出</button>
+      </div>
     </div>
-    <button class="secondary" id="refreshButton">刷新</button>
   </header>
-  <main>
-    <div class="stack">
-      <section>
-        <div class="row">
-          <h2>管理员</h2>
-          <span class="status" id="authState">locked</span>
+
+  <main class="shell">
+    <nav class="quick-nav" aria-label="后台导航">
+      <a href="#overview">总览</a>
+      <a href="#admin-login">管理员</a>
+      <a href="#claude-auth">Claude 登录认证</a>
+      <a href="#api-key-section">API Key</a>
+      <a href="#runtime-config">运行配置</a>
+      <a href="#logs-section">日志</a>
+    </nav>
+
+    <section class="panel" id="overview">
+      <div class="panel-header">
+        <div class="panel-title">
+          <h2>状态总览</h2>
+          <p>服务器、Claude 账号、CLI 并发和下游 Key 的当前状态。</p>
         </div>
-        <div class="form">
-          <label>用户名<input id="username" autocomplete="username" value="admin"></label>
-          <label>密码<input id="password" type="password" autocomplete="current-password"></label>
-          <div class="row">
-            <button id="loginButton">登录</button>
-            <button class="secondary" id="setupButton">初始化</button>
+        <span class="status" id="lastRefreshState">未刷新</span>
+      </div>
+      <div class="overview-grid">
+        <div class="metric">
+          <span>Claude 账号</span>
+          <strong id="accountStatus">unknown</strong>
+          <small id="accountStatusDetail">-</small>
+        </div>
+        <div class="metric">
+          <span>Claude 登录</span>
+          <strong id="claudeAuthStatus">idle</strong>
+          <small id="claudeAuthSummary">-</small>
+        </div>
+        <div class="metric">
+          <span>CLI 窗口</span>
+          <strong id="cliWindowState">0/0</strong>
+          <small id="cliWindowDetail">-</small>
+        </div>
+        <div class="metric">
+          <span>API Key</span>
+          <strong id="apiKeyCount">0</strong>
+          <small id="apiKeyDetail">-</small>
+        </div>
+        <div class="metric">
+          <span>最近事件</span>
+          <strong id="lastLogEvent">-</strong>
+          <small id="lastLogDetail">-</small>
+        </div>
+      </div>
+    </section>
+
+    <div class="content-grid">
+      <div class="stack">
+        <section class="panel" id="claude-auth">
+          <div class="panel-header">
+            <div class="panel-title">
+              <h2>Claude 登录认证</h2>
+              <p>在 Zeabur 上运行登录进程，并把 Claude 返回的输入提交给该进程。</p>
+            </div>
+            <div class="actions">
+              <button id="claudeLoginButton" type="button">开始登录</button>
+              <button class="secondary" id="claudeAuthCheckButton" type="button">检查认证</button>
+            </div>
           </div>
-        </div>
-        <div class="notice" id="authNotice"></div>
-      </section>
-      <section>
-        <h2>运行配置</h2>
-        <div class="form">
-          <label>最大 CLI 数量<input id="maxCliWindows" type="number" min="1"></label>
-          <label>CLI 单次等待 ms<input id="cliTurnTimeoutMs" type="number" min="1000"></label>
-          <label>CLI 空闲释放 ms<input id="cliIdleTimeoutMs" type="number" min="1000"></label>
-          <label>限额冷却 ms<input id="quotaCooldownMs" type="number" min="0"></label>
-          <label>Claude 命令路径<input id="claudeCommand" placeholder="默认使用内置 claude"></label>
-          <label>默认 Claude 模型<input id="claudeModel" placeholder="例如 claude-sonnet-4-6"></label>
-          <label>权限模式<input id="claudePermissionMode" placeholder="例如 acceptEdits"></label>
-          <label>推理力度<input id="claudeEffort" placeholder="low / medium / high"></label>
-          <label>Setting Sources<input id="claudeSettingSources" placeholder="例如 project,local"></label>
-          <label>登录参数<input id="claudeAuthLoginArgs" placeholder="默认 login"></label>
-          <label>认证检查参数<input id="claudeAuthStatusArgs" placeholder="默认 --version"></label>
-          <label>Client Tool 等待 ms<input id="clientToolTimeoutMs" type="number" min="1000"></label>
-          <button id="saveConfigButton">保存配置</button>
-        </div>
-      </section>
-      <section>
-        <div class="row">
-          <h2>Claude 登录认证</h2>
-          <span class="status" id="claudeAuthStatus">idle</span>
-        </div>
-        <div class="form">
-          <div class="row">
-            <button id="claudeLoginButton">登录</button>
-            <button class="secondary" id="claudeAuthCheckButton">检查</button>
+
+          <div class="inline-panel">
+            <div class="form-grid one">
+              <label>认证输入
+                <textarea id="claudeAuthInput" placeholder="粘贴 Claude 登录返回的 code、callback 或需要输入给 CLI 的内容"></textarea>
+              </label>
+            </div>
+            <div class="actions" style="margin-top: 10px;">
+              <button id="claudeAuthInputButton" type="button" disabled>提交给 Claude CLI</button>
+              <button class="secondary" id="copyClaudeAuthLogButton" type="button">复制日志</button>
+            </div>
+            <div class="auth-log-actions">
+              <a class="auth-link hidden" id="claudeAuthLink" href="#" target="_blank" rel="noreferrer"></a>
+              <span class="notice" id="claudeAuthNotice"></span>
+            </div>
           </div>
-        </div>
-        <pre id="claudeAuthLog"></pre>
-      </section>
-    </div>
-    <div class="stack">
-      <section>
-        <div class="row">
-          <h2>Claude 账号</h2>
-          <span class="status" id="accountStatus">unknown</span>
-        </div>
-        <div class="metric-grid">
-          <div class="metric">
-            <span>5小时限额</span>
-            <strong id="fiveHourLimit">unknown</strong>
-            <small id="fiveHourLimitDetail">-</small>
+
+          <pre id="claudeAuthLog">认证日志会显示在这里</pre>
+        </section>
+
+        <section class="panel" id="account-section">
+          <div class="panel-header">
+            <div class="panel-title">
+              <h2>Claude 账号</h2>
+              <p>限额、Token、费用、缓存读取率和平均耗时来自服务实际请求记录。</p>
+            </div>
           </div>
-          <div class="metric">
-            <span>本周限额</span>
-            <strong id="weeklyLimit">unknown</strong>
-            <small id="weeklyLimitDetail">-</small>
+          <div class="overview-grid" style="grid-template-columns: repeat(2, minmax(0, 1fr));">
+            <div class="metric">
+              <span>5小时限额</span>
+              <strong id="fiveHourLimit">unknown</strong>
+              <small id="fiveHourLimitDetail">-</small>
+            </div>
+            <div class="metric">
+              <span>本周限额</span>
+              <strong id="weeklyLimit">unknown</strong>
+              <small id="weeklyLimitDetail">-</small>
+            </div>
           </div>
-        </div>
-        <table>
-          <thead>
-            <tr>
-              <th>时间窗口</th>
-              <th>请求</th>
-              <th>Token</th>
-              <th>费用</th>
-              <th>平均耗时</th>
-              <th>缓存读取率</th>
-            </tr>
-          </thead>
-          <tbody id="accountUsageRows"></tbody>
-        </table>
-        <pre id="accountJson">{}</pre>
-      </section>
-      <section>
-        <div class="row">
-          <h2>CLI 窗口</h2>
-          <span class="status" id="cliWindowState">0/0</span>
-        </div>
-        <table>
-          <thead>
-            <tr>
-              <th>ID</th>
-              <th>状态</th>
-              <th>轮次</th>
-              <th>Token</th>
-              <th>费用</th>
-              <th>平均耗时</th>
-              <th>缓存读取率</th>
-              <th>最近活跃</th>
-            </tr>
-          </thead>
-          <tbody id="cliWindows"></tbody>
-        </table>
-      </section>
-      <section>
-        <h2>下游 API Key</h2>
-        <div class="form">
-          <label>名称<input id="apiKeyName" value="production-client"></label>
-          <button id="createKeyButton">创建 Key</button>
-        </div>
-        <pre id="createdKey"></pre>
-        <table>
-          <thead><tr><th>名称</th><th>前缀</th><th>创建时间</th><th>状态</th><th>操作</th></tr></thead>
-          <tbody id="apiKeys"></tbody>
-        </table>
-      </section>
-      <section>
-        <h2>日志</h2>
-        <table>
-          <thead><tr><th>时间</th><th>级别</th><th>事件</th><th>内容</th></tr></thead>
-          <tbody id="logs"></tbody>
-        </table>
-      </section>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>时间窗口</th>
+                  <th>请求</th>
+                  <th>Token</th>
+                  <th>费用</th>
+                  <th>平均耗时</th>
+                  <th>缓存读取率</th>
+                </tr>
+              </thead>
+              <tbody id="accountUsageRows"></tbody>
+            </table>
+          </div>
+          <details>
+            <summary>账号原始数据</summary>
+            <pre id="accountJson">{}</pre>
+          </details>
+        </section>
+
+        <section class="panel" id="cli-section">
+          <div class="panel-header">
+            <div class="panel-title">
+              <h2>CLI 窗口</h2>
+              <p>当前服务器内由管理后台配置的 Claude CLI 并发窗口。</p>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>状态</th>
+                  <th>轮次</th>
+                  <th>Token</th>
+                  <th>费用</th>
+                  <th>平均耗时</th>
+                  <th>缓存读取率</th>
+                  <th>最近活跃</th>
+                </tr>
+              </thead>
+              <tbody id="cliWindows"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
+      <div class="stack">
+        <section class="panel" id="admin-login">
+          <div class="panel-header">
+            <div class="panel-title">
+              <h2>管理员</h2>
+              <p>首次部署用初始化，后续用登录。</p>
+            </div>
+          </div>
+          <div class="form-grid one">
+            <label>用户名
+              <input id="username" autocomplete="username" value="admin">
+            </label>
+            <label>密码
+              <input id="password" type="password" autocomplete="current-password">
+            </label>
+          </div>
+          <div class="actions" style="margin-top: 12px;">
+            <button id="loginButton" type="button">登录</button>
+            <button class="secondary" id="setupButton" type="button">初始化</button>
+          </div>
+          <div class="notice" id="authNotice"></div>
+        </section>
+
+        <section class="panel" id="api-key-section">
+          <div class="panel-header">
+            <div class="panel-title">
+              <h2>下游 API Key</h2>
+              <p>创建给业务方使用的访问 Key，创建后只显示一次完整值。</p>
+            </div>
+          </div>
+          <div class="form-grid one">
+            <label>名称
+              <input id="apiKeyName" value="production-client">
+            </label>
+          </div>
+          <div class="actions" style="margin-top: 12px;">
+            <button id="createKeyButton" type="button">创建 Key</button>
+            <button class="secondary" id="copyCreatedKeyButton" type="button">复制新 Key</button>
+          </div>
+          <div class="created-key">
+            <div class="key-output">
+              <pre id="createdKey" data-value="">创建后显示完整 Key</pre>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>名称</th>
+                  <th>前缀</th>
+                  <th>创建时间</th>
+                  <th>状态</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="apiKeys"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel" id="runtime-config">
+          <div class="panel-header">
+            <div class="panel-title">
+              <h2>运行配置</h2>
+              <p>保存后新请求会按后台配置运行，避免在 Zeabur 里频繁改环境变量。</p>
+            </div>
+            <button id="saveConfigButton" type="button">保存配置</button>
+          </div>
+          <div class="form-grid">
+            <label>最大 CLI 数量
+              <input id="maxCliWindows" type="number" min="1">
+            </label>
+            <label>CLI 单次等待 ms
+              <input id="cliTurnTimeoutMs" type="number" min="1000">
+            </label>
+            <label>CLI 空闲释放 ms
+              <input id="cliIdleTimeoutMs" type="number" min="1000">
+            </label>
+            <label>限额冷却 ms
+              <input id="quotaCooldownMs" type="number" min="0">
+            </label>
+            <label>Claude 命令路径
+              <input id="claudeCommand" placeholder="默认使用内置 claude">
+            </label>
+            <label>默认 Claude 模型
+              <input id="claudeModel" placeholder="例如 claude-sonnet-4-6">
+            </label>
+          </div>
+          <details>
+            <summary>高级 Claude 参数</summary>
+            <div class="form-grid">
+              <label>权限模式
+                <input id="claudePermissionMode" placeholder="例如 acceptEdits">
+              </label>
+              <label>推理力度
+                <input id="claudeEffort" placeholder="low / medium / high">
+              </label>
+              <label>Setting Sources
+                <input id="claudeSettingSources" placeholder="例如 project,local">
+              </label>
+              <label>登录参数
+                <input id="claudeAuthLoginArgs" placeholder="默认 login">
+              </label>
+              <label>认证检查参数
+                <input id="claudeAuthStatusArgs" placeholder="默认 --version">
+              </label>
+              <label>Client Tool 等待 ms
+                <input id="clientToolTimeoutMs" type="number" min="1000">
+              </label>
+            </div>
+          </details>
+        </section>
+
+        <section class="panel" id="logs-section">
+          <div class="panel-header">
+            <div class="panel-title">
+              <h2>日志</h2>
+              <p>后台操作、账号错误和服务运行日志。</p>
+            </div>
+            <button class="secondary" id="reloadLogsButton" type="button">刷新日志</button>
+          </div>
+          <div class="form-grid">
+            <label>级别
+              <select id="logLevelFilter">
+                <option value="">全部</option>
+                <option value="info">info</option>
+                <option value="warn">warn</option>
+                <option value="error">error</option>
+              </select>
+            </label>
+            <label>搜索
+              <input id="logSearch" placeholder="事件、内容、JSON">
+            </label>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>级别</th>
+                  <th>事件</th>
+                  <th>内容</th>
+                </tr>
+              </thead>
+              <tbody id="logs"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
     </div>
   </main>
+
   <script>
     const tokenKey = "cc_proxy_admin_token";
     let token = localStorage.getItem(tokenKey) || "";
+    let cachedLogs = [];
+    let refreshTimer = null;
 
     const $ = (id) => document.getElementById(id);
 
-    function setNotice(id, text) {
-      $(id).textContent = text || "";
+    function setNotice(id, text, type = "") {
+      const el = $(id);
+      el.textContent = text || "";
+      el.className = `notice ${type}`.trim();
     }
 
     function setToken(nextToken) {
@@ -334,32 +801,50 @@
       if (token) localStorage.setItem(tokenKey, token);
       else localStorage.removeItem(tokenKey);
       $("authState").textContent = token ? "active" : "locked";
-      $("authState").className = `status ${token ? "ready" : ""}`;
-      $("sessionState").textContent = token ? "已登录" : "未登录";
+      $("authState").className = `status ${token ? "active" : "locked"}`;
+      $("sessionState").textContent = token ? "已登录，后台数据会自动刷新" : "未登录";
+      document.body.dataset.authenticated = token ? "true" : "false";
+    }
+
+    function errorMessage(body, text, status) {
+      if (typeof body?.error?.message === "string") return body.error.message;
+      if (typeof body?.error === "string") return body.error;
+      if (typeof body?.message === "string") return body.message;
+      return text || `HTTP ${status}`;
     }
 
     async function api(path, options = {}) {
       const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
-      if (token) headers.Authorization = `Bearer ${token}`;
+      if (token && !options.skipAuth) headers.Authorization = `Bearer ${token}`;
       const res = await fetch(path, { ...options, headers });
       const text = await res.text();
       let body = {};
       try { body = text ? JSON.parse(text) : {}; } catch { body = { raw: text }; }
-      if (!res.ok) throw new Error(body.error || body.error?.message || text || `HTTP ${res.status}`);
+      if (!res.ok) {
+        const err = new Error(errorMessage(body, text, res.status));
+        err.status = res.status;
+        throw err;
+      }
       return body;
     }
 
     async function authenticate(path) {
-      const username = $("username").value;
+      const username = $("username").value.trim();
       const password = $("password").value;
       const body = await api(path, {
         method: "POST",
         body: JSON.stringify({ username, password }),
-        headers: {},
+        skipAuth: true,
       });
       setToken(body.token);
-      setNotice("authNotice", "OK");
+      setNotice("authNotice", "已登录", "ok");
       await refreshAll();
+    }
+
+    function logout() {
+      setToken("");
+      setNotice("authNotice", "已退出");
+      stopAuthPolling();
     }
 
     async function loadConfig() {
@@ -384,49 +869,101 @@
         cli_turn_timeout_ms: Number($("cliTurnTimeoutMs").value),
         cli_idle_timeout_ms: Number($("cliIdleTimeoutMs").value),
         quota_cooldown_ms: Number($("quotaCooldownMs").value),
-        claude_command: $("claudeCommand").value,
-        claude_model: $("claudeModel").value,
-        claude_permission_mode: $("claudePermissionMode").value,
-        claude_effort: $("claudeEffort").value,
-        claude_setting_sources: $("claudeSettingSources").value,
-        claude_auth_login_args: $("claudeAuthLoginArgs").value,
-        claude_auth_status_args: $("claudeAuthStatusArgs").value,
+        claude_command: $("claudeCommand").value.trim(),
+        claude_model: $("claudeModel").value.trim(),
+        claude_permission_mode: $("claudePermissionMode").value.trim(),
+        claude_effort: $("claudeEffort").value.trim(),
+        claude_setting_sources: $("claudeSettingSources").value.trim(),
+        claude_auth_login_args: $("claudeAuthLoginArgs").value.trim(),
+        claude_auth_status_args: $("claudeAuthStatusArgs").value.trim(),
         client_tool_timeout_ms: Number($("clientToolTimeoutMs").value),
       };
       await api("/admin/config", { method: "PUT", body: JSON.stringify(config) });
+      setNotice("authNotice", "配置已保存", "ok");
       await refreshAll();
     }
 
     async function loadClaudeAuth() {
       const { auth } = await api("/admin/claude-auth");
-      $("claudeAuthStatus").textContent = auth.status;
-      $("claudeAuthStatus").className = `status ${statusClass(auth.status)}`;
-      $("claudeAuthLog").textContent = [
+      const status = auth.status || "idle";
+      $("claudeAuthStatus").textContent = status;
+      $("claudeAuthStatus").className = `status ${statusClass(status)}`;
+      $("claudeAuthSummary").textContent = auth.started_at
+        ? `started ${formatDateTime(auth.started_at)}`
+        : "-";
+      $("claudeAuthInputButton").disabled = status !== "running";
+      const logText = [
         auth.command ? `$ ${auth.command} ${(auth.args || []).join(" ")}` : "",
         auth.started_at ? `started: ${auth.started_at}` : "",
         auth.completed_at ? `completed: ${auth.completed_at}` : "",
         auth.exit_code == null ? "" : `exit: ${auth.exit_code}`,
         auth.log || "",
       ].filter(Boolean).join("\n");
+      $("claudeAuthLog").textContent = logText || "认证日志会显示在这里";
+      renderClaudeAuthLink(logText);
+      if (status === "running") startAuthPolling();
+      else stopAuthPolling();
     }
 
     async function startClaudeAuth(path) {
+      setNotice("claudeAuthNotice", "认证任务已启动", "ok");
       await api(path, { method: "POST", body: "{}" });
       await loadClaudeAuth();
     }
 
+    async function submitClaudeAuthInput() {
+      const input = $("claudeAuthInput").value;
+      await api("/admin/claude-auth/input", {
+        method: "POST",
+        body: JSON.stringify({ input }),
+      });
+      $("claudeAuthInput").value = "";
+      setNotice("claudeAuthNotice", "已提交给 Claude CLI", "ok");
+      await loadClaudeAuth();
+    }
+
+    function startAuthPolling() {
+      if (refreshTimer) return;
+      refreshTimer = setInterval(() => {
+        if (token) loadClaudeAuth().catch((err) => setNotice("claudeAuthNotice", err.message, "error"));
+      }, 2500);
+    }
+
+    function stopAuthPolling() {
+      if (!refreshTimer) return;
+      clearInterval(refreshTimer);
+      refreshTimer = null;
+    }
+
+    function renderClaudeAuthLink(logText) {
+      const link = $("claudeAuthLink");
+      const match = String(logText || "").match(/https?:\/\/[^\s"'<>]+/);
+      if (!match) {
+        link.classList.add("hidden");
+        link.removeAttribute("href");
+        link.textContent = "";
+        return;
+      }
+      link.href = match[0];
+      link.textContent = match[0];
+      link.classList.remove("hidden");
+    }
+
     async function loadAccount() {
       const { account } = await api("/admin/account");
-      $("accountStatus").textContent = account.status;
-      $("accountStatus").className = `status ${account.status}`;
+      const status = account.status || "unknown";
+      $("accountStatus").textContent = status;
+      $("accountStatus").className = `status ${statusClass(status)}`;
+      $("accountStatusDetail").textContent = account.last_error?.message || "-";
       renderLimit("fiveHourLimit", "fiveHourLimitDetail", account.limits?.five_hour);
       renderLimit("weeklyLimit", "weeklyLimitDetail", account.limits?.weekly);
+      const usage = account.usage || {};
       $("accountUsageRows").innerHTML = [
-        ["今日", account.usage.today],
-        ["本周", account.usage.week],
-        ["本月", account.usage.month],
-      ].map(([label, usage]) => (
-        `<tr><td>${label}</td><td>${usage.request_count}</td><td>${formatTokenUsage(usage)}</td><td>${formatUsd(usage.cost_usd)}</td><td>${formatDuration(usage.average_duration_ms)}</td><td>${formatPercent(usage.cache_read_rate)}</td></tr>`
+        ["今日", usage.today || {}],
+        ["本周", usage.week || {}],
+        ["本月", usage.month || {}],
+      ].map(([label, item]) => (
+        `<tr><td>${label}</td><td>${Number(item.request_count || 0)}</td><td>${formatTokenUsage(item)}</td><td>${formatUsd(item.cost_usd)}</td><td>${formatDuration(item.average_duration_ms)}</td><td>${formatPercent(item.cache_read_rate)}</td></tr>`
       )).join("");
       $("accountJson").textContent = JSON.stringify(account, null, 2);
     }
@@ -435,34 +972,38 @@
       const body = await api("/admin/cli-windows");
       $("cliWindowState").textContent = `${body.active}/${body.limit}`;
       $("cliWindowState").className = `status ${body.active > 0 ? "ready" : ""}`;
+      $("cliWindowDetail").textContent = body.active > 0 ? "有请求正在占用 CLI" : "当前空闲";
       if (!body.windows.length) {
         $("cliWindows").innerHTML = `<tr><td class="empty" colspan="8">暂无 CLI 窗口</td></tr>`;
         return;
       }
       $("cliWindows").innerHTML = body.windows.map((window) => (
-        `<tr><td>${escapeHtml(shortId(window.id))}<br>${escapeHtml(window.cli_session_id || "-")}</td><td><span class="status ${statusClass(window.state)}">${escapeHtml(window.state)}</span></td><td>${window.turns}</td><td>${formatTokenUsage(window.usage)}</td><td>${formatUsd(window.usage.cost_usd)}</td><td>${formatDuration(window.usage.average_duration_ms)}</td><td>${formatPercent(window.usage.cache_read_rate)}</td><td>${formatTime(window.last_active_at)}</td></tr>`
+        `<tr><td>${escapeHtml(shortId(window.id))}<br><small>${escapeHtml(window.cli_session_id || "-")}</small></td><td><span class="status ${statusClass(window.state)}">${escapeHtml(window.state)}</span></td><td>${window.turns}</td><td>${formatTokenUsage(window.usage)}</td><td>${formatUsd(window.usage?.cost_usd)}</td><td>${formatDuration(window.usage?.average_duration_ms)}</td><td>${formatPercent(window.usage?.cache_read_rate)}</td><td>${formatTime(window.last_active_at)}</td></tr>`
       )).join("");
     }
 
     async function loadKeys() {
       const { keys } = await api("/admin/api-keys");
+      $("apiKeyCount").textContent = keys.length;
+      $("apiKeyDetail").textContent = `${keys.filter((key) => key.enabled).length} enabled`;
       if (!keys.length) {
         $("apiKeys").innerHTML = `<tr><td class="empty" colspan="5">暂无 API Key</td></tr>`;
         return;
       }
       $("apiKeys").innerHTML = keys.map((key) => (
-        `<tr><td>${escapeHtml(key.name)}</td><td>${escapeHtml(key.prefix)}</td><td>${escapeHtml(key.created_at)}</td><td>${key.enabled ? "enabled" : "disabled"}</td><td><div class="actions"><button class="secondary" data-key-action="toggle" data-key-id="${escapeHtml(key.id)}" data-key-enabled="${key.enabled ? "false" : "true"}">${key.enabled ? "禁用" : "启用"}</button><button class="danger" data-key-action="delete" data-key-id="${escapeHtml(key.id)}">删除</button></div></td></tr>`
+        `<tr><td>${escapeHtml(key.name)}</td><td>${escapeHtml(key.prefix)}</td><td>${escapeHtml(key.created_at)}</td><td><span class="status ${key.enabled ? "ready" : "closed"}">${key.enabled ? "enabled" : "disabled"}</span></td><td><div class="actions"><button class="secondary" type="button" data-key-action="toggle" data-key-id="${escapeHtml(key.id)}" data-key-enabled="${key.enabled ? "false" : "true"}">${key.enabled ? "禁用" : "启用"}</button><button class="danger" type="button" data-key-action="delete" data-key-id="${escapeHtml(key.id)}">删除</button></div></td></tr>`
       )).join("");
     }
 
     async function createKey() {
       const body = await api("/admin/api-keys", {
         method: "POST",
-        body: JSON.stringify({ name: $("apiKeyName").value }),
+        body: JSON.stringify({ name: $("apiKeyName").value.trim() }),
       });
+      $("createdKey").dataset.value = body.key.value;
       $("createdKey").textContent = body.key.value;
-      await loadKeys();
-      await loadLogs();
+      setNotice("authNotice", "Key 已创建，完整值只显示一次", "ok");
+      await Promise.all([loadKeys(), loadLogs()]);
     }
 
     async function toggleKey(id, enabled) {
@@ -470,29 +1011,94 @@
         method: "PATCH",
         body: JSON.stringify({ enabled }),
       });
-      await loadKeys();
-      await loadLogs();
+      await Promise.all([loadKeys(), loadLogs()]);
     }
 
     async function deleteKey(id) {
       if (!confirm("删除这个 API Key?")) return;
-      await api(`/admin/api-keys/${encodeURIComponent(id)}`, {
-        method: "DELETE",
-      });
-      await loadKeys();
-      await loadLogs();
+      await api(`/admin/api-keys/${encodeURIComponent(id)}`, { method: "DELETE" });
+      await Promise.all([loadKeys(), loadLogs()]);
     }
 
     async function loadLogs() {
       const { logs } = await api("/admin/logs?limit=100");
-      $("logs").innerHTML = logs.map((entry) => (
-        `<tr><td>${escapeHtml(entry.at)}</td><td>${escapeHtml(entry.level)}</td><td>${escapeHtml(entry.event)}</td><td>${formatLogEntry(entry)}</td></tr>`
+      cachedLogs = logs;
+      renderLogRows();
+      const latest = logs[0];
+      $("lastLogEvent").textContent = latest?.event || "-";
+      $("lastLogDetail").textContent = latest ? `${latest.level} / ${formatDateTime(latest.at)}` : "-";
+    }
+
+    function renderLogRows() {
+      const level = $("logLevelFilter").value;
+      const query = $("logSearch").value.trim().toLowerCase();
+      const rows = cachedLogs.filter((entry) => {
+        if (level && entry.level !== level) return false;
+        if (!query) return true;
+        return JSON.stringify(entry).toLowerCase().includes(query);
+      });
+      if (!rows.length) {
+        $("logs").innerHTML = `<tr><td class="empty" colspan="4">暂无匹配日志</td></tr>`;
+        return;
+      }
+      $("logs").innerHTML = rows.map((entry) => (
+        `<tr><td>${escapeHtml(formatDateTime(entry.at))}</td><td><span class="status ${statusClass(entry.level)}">${escapeHtml(entry.level)}</span></td><td>${escapeHtml(entry.event)}</td><td>${formatLogEntry(entry)}</td></tr>`
       )).join("");
     }
 
     async function refreshAll() {
       if (!token) return;
-      await Promise.all([loadConfig(), loadClaudeAuth(), loadAccount(), loadCliWindows(), loadKeys(), loadLogs()]);
+      const results = await Promise.allSettled([
+        loadConfig(),
+        loadClaudeAuth(),
+        loadAccount(),
+        loadCliWindows(),
+        loadKeys(),
+        loadLogs(),
+      ]);
+      handleRefreshResults(results);
+    }
+
+    async function refreshRuntime() {
+      if (!token) return;
+      const results = await Promise.allSettled([
+        loadClaudeAuth(),
+        loadAccount(),
+        loadCliWindows(),
+        loadKeys(),
+        loadLogs(),
+      ]);
+      handleRefreshResults(results);
+    }
+
+    function handleRefreshResults(results) {
+      const rejected = results.find((result) => result.status === "rejected");
+      const now = new Date().toLocaleTimeString();
+      if (!rejected) {
+        $("lastRefreshState").textContent = now;
+        $("lastRefreshState").className = "status ready";
+        return;
+      }
+      const reason = rejected.reason;
+      if (reason?.status === 401) {
+        setToken("");
+        setNotice("authNotice", "登录已过期", "error");
+      }
+      $("lastRefreshState").textContent = reason?.message || "刷新失败";
+      $("lastRefreshState").className = "status error";
+    }
+
+    async function copyText(text, noticeId) {
+      if (!text) {
+        setNotice(noticeId, "没有可复制内容", "error");
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(text);
+        setNotice(noticeId, "已复制", "ok");
+      } catch {
+        setNotice(noticeId, "浏览器未允许复制，请手动选择文本", "error");
+      }
     }
 
     function escapeHtml(value) {
@@ -547,9 +1153,9 @@
     }
 
     function statusClass(state) {
-      if (state === "ready") return "ready";
-      if (state === "succeeded") return "ready";
-      if (state === "failed" || state === "closed") return "error";
+      if (["ready", "succeeded", "active", "info"].includes(state)) return "ready";
+      if (["running", "cooldown", "warn", "warning"].includes(state)) return "running";
+      if (["failed", "closed", "error", "banned", "locked"].includes(state)) return "error";
       return "";
     }
 
@@ -558,12 +1164,30 @@
       return Number.isFinite(date.getTime()) ? date.toLocaleString() : "-";
     }
 
-    $("setupButton").onclick = () => authenticate("/admin/setup").catch((err) => setNotice("authNotice", err.message));
-    $("loginButton").onclick = () => authenticate("/admin/auth/login").catch((err) => setNotice("authNotice", err.message));
-    $("saveConfigButton").onclick = () => saveConfig().catch((err) => setNotice("authNotice", err.message));
-    $("claudeLoginButton").onclick = () => startClaudeAuth("/admin/claude-auth/login").catch((err) => setNotice("authNotice", err.message));
-    $("claudeAuthCheckButton").onclick = () => startClaudeAuth("/admin/claude-auth/check").catch((err) => setNotice("authNotice", err.message));
-    $("createKeyButton").onclick = () => createKey().catch((err) => setNotice("authNotice", err.message));
+    function formatDateTime(value) {
+      const date = new Date(value);
+      return Number.isFinite(date.getTime()) ? date.toLocaleString() : String(value || "-");
+    }
+
+    function runAction(fn, noticeId = "authNotice") {
+      return fn().catch((err) => setNotice(noticeId, err.message, "error"));
+    }
+
+    $("setupButton").onclick = () => runAction(() => authenticate("/admin/setup"));
+    $("loginButton").onclick = () => runAction(() => authenticate("/admin/auth/login"));
+    $("logoutButton").onclick = logout;
+    $("saveConfigButton").onclick = () => runAction(saveConfig);
+    $("claudeLoginButton").onclick = () => runAction(() => startClaudeAuth("/admin/claude-auth/login"), "claudeAuthNotice");
+    $("claudeAuthCheckButton").onclick = () => runAction(() => startClaudeAuth("/admin/claude-auth/check"), "claudeAuthNotice");
+    $("claudeAuthInputButton").onclick = () => runAction(submitClaudeAuthInput, "claudeAuthNotice");
+    $("copyClaudeAuthLogButton").onclick = () => copyText($("claudeAuthLog").textContent, "claudeAuthNotice");
+    $("createKeyButton").onclick = () => runAction(createKey);
+    $("copyCreatedKeyButton").onclick = () => copyText($("createdKey").dataset.value || "", "authNotice");
+    $("reloadLogsButton").onclick = () => runAction(loadLogs);
+    $("refreshButton").onclick = () => runAction(refreshAll);
+    $("logLevelFilter").onchange = renderLogRows;
+    $("logSearch").oninput = renderLogRows;
+
     $("apiKeys").onclick = (event) => {
       const button = event.target instanceof Element
         ? event.target.closest("button[data-key-action]")
@@ -572,14 +1196,15 @@
       const id = button.dataset.keyId;
       if (!id) return;
       if (button.dataset.keyAction === "toggle") {
-        toggleKey(id, button.dataset.keyEnabled === "true").catch((err) => setNotice("authNotice", err.message));
+        runAction(() => toggleKey(id, button.dataset.keyEnabled === "true"));
       } else if (button.dataset.keyAction === "delete") {
-        deleteKey(id).catch((err) => setNotice("authNotice", err.message));
+        runAction(() => deleteKey(id));
       }
     };
-    $("refreshButton").onclick = () => refreshAll().catch((err) => setNotice("authNotice", err.message));
+
     setToken(token);
     refreshAll().catch(() => {});
+    setInterval(refreshRuntime, 10000);
   </script>
 </body>
 </html>
