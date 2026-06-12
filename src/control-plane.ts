@@ -45,6 +45,8 @@ interface ControlPlaneState {
   api_keys: StoredApiKey[];
 }
 
+const DEFAULT_CLAUDE_AUTH_LOGIN_ARGS = "setup-token";
+
 export interface CreatedApiKey {
   id: string;
   name: string;
@@ -224,7 +226,7 @@ export function defaultRuntimeConfig(): RuntimeConfig {
     claude_permission_mode: normalizeOptionalString(process.env.CC_PERMISSION_MODE, 80),
     claude_effort: normalizeOptionalString(process.env.CC_CLAUDE_EFFORT, 40),
     claude_setting_sources: normalizeOptionalString(process.env.CC_CLAUDE_SETTING_SOURCES, 160),
-    claude_auth_login_args: normalizeOptionalString(process.env.CC_CLAUDE_AUTH_LOGIN_ARGS || "login", 200),
+    claude_auth_login_args: normalizeClaudeAuthLoginArgs(process.env.CC_CLAUDE_AUTH_LOGIN_ARGS),
     claude_auth_status_args: normalizeOptionalString(process.env.CC_CLAUDE_AUTH_STATUS_ARGS || "--version", 200),
     client_tool_timeout_ms: parsePositiveInt(process.env.CC_CLIENT_TOOL_TIMEOUT_MS, 300_000),
   };
@@ -245,7 +247,7 @@ function normalizeRuntimeConfig(value: Partial<RuntimeConfig>): RuntimeConfig {
     claude_permission_mode: normalizeOptionalString(value.claude_permission_mode, 80),
     claude_effort: normalizeOptionalString(value.claude_effort, 40),
     claude_setting_sources: normalizeOptionalString(value.claude_setting_sources, 160),
-    claude_auth_login_args: normalizeOptionalString(value.claude_auth_login_args, 200),
+    claude_auth_login_args: normalizeClaudeAuthLoginArgs(value.claude_auth_login_args),
     claude_auth_status_args: normalizeOptionalString(value.claude_auth_status_args, 200),
     client_tool_timeout_ms: boundedInt(value.client_tool_timeout_ms, 1_000, 24 * 60 * 60 * 1000, 300_000),
   };
@@ -269,6 +271,12 @@ function normalizeOptionalString(value: unknown, maxLength: number): string {
   if (typeof value !== "string") return "";
   const trimmed = value.trim();
   return trimmed.length > maxLength ? trimmed.slice(0, maxLength) : trimmed;
+}
+
+function normalizeClaudeAuthLoginArgs(value: unknown): string {
+  const normalized = normalizeOptionalString(value, 200);
+  if (!normalized || normalized === "login") return DEFAULT_CLAUDE_AUTH_LOGIN_ARGS;
+  return normalized;
 }
 
 function normalizeUsername(username: string): string {

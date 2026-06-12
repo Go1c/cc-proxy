@@ -24,6 +24,7 @@ import { AccountState } from "./account-state";
 import { AuditLog } from "./audit-log";
 import { ControlPlane } from "./control-plane";
 import { ClaudeAuthJob, splitCommandArgs } from "./claude-auth-job";
+import { resolveDataDir } from "./data-dir";
 
 const PORT = parseInt(process.env.PORT || process.env.CC_PROXY_PORT || "3456", 10);
 const DOWNSTREAM_ROOT = path.resolve(
@@ -33,18 +34,21 @@ const SESSION_CWD = path.resolve(
   process.env.CC_SESSION_CWD || path.join(__dirname, "..", "test-workspace")
 );
 const TEMP_DIR = path.join(os.tmpdir(), "cc-proxy");
-const DATA_DIR = path.resolve(process.env.CC_PROXY_DATA_DIR || path.join(process.cwd(), ".cc-proxy-data"));
+const DATA_DIR = resolveDataDir();
 const CLAUDE_HOME_DIR = path.join(DATA_DIR, "claude-home");
 const LEGACY_CLIENT_API_KEY = process.env.CC_PROXY_API_KEY || "";
+const CONTROL_PLANE_PATH = path.join(DATA_DIR, "control-plane.json");
+const AUDIT_LOG_PATH = path.join(DATA_DIR, "audit-log.json");
+const ACCOUNT_STATE_PATH = path.join(DATA_DIR, "account-state.json");
 
 // Ensure temp dir exists
 fs.mkdirSync(TEMP_DIR, { recursive: true });
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(CLAUDE_HOME_DIR, { recursive: true });
 
-const controlPlane = new ControlPlane(path.join(DATA_DIR, "control-plane.json"));
-const auditLog = new AuditLog(path.join(DATA_DIR, "audit-log.json"));
-const accountState = new AccountState(path.join(DATA_DIR, "account-state.json"));
+const controlPlane = new ControlPlane(CONTROL_PLANE_PATH);
+const auditLog = new AuditLog(AUDIT_LOG_PATH);
+const accountState = new AccountState(ACCOUNT_STATE_PATH);
 const claudeAuthJob = new ClaudeAuthJob();
 const sessions = new SessionManager(SESSION_CWD, () => controlPlane.getConfig());
 
@@ -1344,6 +1348,22 @@ async function handleAdminRequest(
     return true;
   }
 
+  if (req.method === "GET" && pathname === "/admin/system") {
+    sendJson(res, 200, {
+      storage: {
+        data_dir: DATA_DIR,
+        claude_home_dir: CLAUDE_HOME_DIR,
+        control_plane_path: CONTROL_PLANE_PATH,
+        control_plane_exists: fs.existsSync(CONTROL_PLANE_PATH),
+        audit_log_path: AUDIT_LOG_PATH,
+        audit_log_exists: fs.existsSync(AUDIT_LOG_PATH),
+        account_state_path: ACCOUNT_STATE_PATH,
+        account_state_exists: fs.existsSync(ACCOUNT_STATE_PATH),
+      },
+    });
+    return true;
+  }
+
   if (req.method === "GET" && pathname === "/admin/claude-auth") {
     const config = controlPlane.getConfig();
     sendJson(res, 200, {
@@ -1362,7 +1382,7 @@ async function handleAdminRequest(
       const config = controlPlane.getConfig();
       const snapshot = claudeAuthJob.start({
         command: resolveClaudeCommand(config.claude_command || undefined),
-        args: splitCommandArgs(config.claude_auth_login_args || "login"),
+        args: splitCommandArgs(config.claude_auth_login_args || "setup-token"),
         cwd: SESSION_CWD,
         env: { HOME: CLAUDE_HOME_DIR },
       });

@@ -234,6 +234,10 @@
       gap: 10px;
     }
 
+    .overview-grid.two-column {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
     .metric,
     .inline-panel {
       border: 1px solid var(--line);
@@ -454,6 +458,10 @@
         grid-template-columns: 1fr;
       }
 
+      .overview-grid.two-column {
+        grid-template-columns: 1fr;
+      }
+
       .panel-header {
         flex-direction: column;
         align-items: stretch;
@@ -490,6 +498,7 @@
       <a href="#claude-auth">Claude 登录认证</a>
       <a href="#api-key-section">API Key</a>
       <a href="#runtime-config">运行配置</a>
+      <a href="#storage-section">存储</a>
       <a href="#logs-section">日志</a>
     </nav>
 
@@ -570,7 +579,7 @@
               <p>限额、Token、费用、缓存读取率和平均耗时来自服务实际请求记录。</p>
             </div>
           </div>
-          <div class="overview-grid" style="grid-template-columns: repeat(2, minmax(0, 1fr));">
+          <div class="overview-grid two-column">
             <div class="metric">
               <span>5小时限额</span>
               <strong id="fiveHourLimit">unknown</strong>
@@ -731,7 +740,7 @@
                 <input id="claudeSettingSources" placeholder="例如 project,local">
               </label>
               <label>登录参数
-                <input id="claudeAuthLoginArgs" placeholder="默认 login">
+                <input id="claudeAuthLoginArgs" placeholder="默认 setup-token">
               </label>
               <label>认证检查参数
                 <input id="claudeAuthStatusArgs" placeholder="默认 --version">
@@ -741,6 +750,48 @@
               </label>
             </div>
           </details>
+        </section>
+
+        <section class="panel" id="storage-section">
+          <div class="panel-header">
+            <div class="panel-title">
+              <h2>存储 / 持久化</h2>
+              <p>确认管理员、API Key、配置、日志和 Claude 登录态是否写入 Zeabur Volume。</p>
+            </div>
+            <span class="status" id="storagePersistenceState">unknown</span>
+          </div>
+          <div class="overview-grid two-column">
+            <div class="metric">
+              <span>数据目录</span>
+              <strong id="storageDataDir">-</strong>
+              <small id="storagePersistenceDetail">-</small>
+            </div>
+            <div class="metric">
+              <span>Claude HOME</span>
+              <strong id="storageClaudeHomeDir">-</strong>
+              <small>登录态会写在这里</small>
+            </div>
+            <div class="metric">
+              <span>管理员 / API Key / 配置</span>
+              <strong id="storageControlPlaneState">unknown</strong>
+              <small id="storageControlPlanePath">-</small>
+            </div>
+            <div class="metric">
+              <span>日志</span>
+              <strong id="storageAuditLogState">unknown</strong>
+              <small id="storageAuditLogPath">-</small>
+            </div>
+            <div class="metric">
+              <span>账号统计</span>
+              <strong id="storageAccountStateState">unknown</strong>
+              <small id="storageAccountStatePath">-</small>
+            </div>
+            <div class="metric">
+              <span>建议</span>
+              <strong id="storageRecommendation">-</strong>
+              <small>Zeabur 推荐挂载 /data</small>
+            </div>
+          </div>
         </section>
 
         <section class="panel" id="logs-section">
@@ -821,7 +872,10 @@
       let body = {};
       try { body = text ? JSON.parse(text) : {}; } catch { body = { raw: text }; }
       if (!res.ok) {
-        const err = new Error(errorMessage(body, text, res.status));
+        const message = res.status === 401 && !options.skipAuth
+          ? "未授权：管理员会话已过期，请重新登录，不需要重新初始化。"
+          : errorMessage(body, text, res.status);
+        const err = new Error(message);
         err.status = res.status;
         throw err;
       }
@@ -861,6 +915,23 @@
       $("claudeAuthLoginArgs").value = config.claude_auth_login_args || "";
       $("claudeAuthStatusArgs").value = config.claude_auth_status_args || "";
       $("clientToolTimeoutMs").value = config.client_tool_timeout_ms;
+    }
+
+    async function loadSystem() {
+      const { storage } = await api("/admin/system");
+      const dataDir = storage.data_dir || "-";
+      const isZeaburVolume = String(dataDir).startsWith("/data/");
+      $("storageDataDir").textContent = dataDir;
+      $("storageClaudeHomeDir").textContent = storage.claude_home_dir || "-";
+      $("storagePersistenceState").textContent = isZeaburVolume ? "persistent" : "local";
+      $("storagePersistenceState").className = `status ${isZeaburVolume ? "ready" : "warning"}`;
+      $("storagePersistenceDetail").textContent = isZeaburVolume
+        ? "正在使用 Zeabur Volume /data"
+        : "当前不是 /data，重部署可能丢失后台数据";
+      $("storageRecommendation").textContent = isZeaburVolume ? "配置正确" : "设置 CC_PROXY_DATA_DIR=/data/cc-proxy";
+      renderStorageFile("storageControlPlane", storage.control_plane_path, storage.control_plane_exists);
+      renderStorageFile("storageAuditLog", storage.audit_log_path, storage.audit_log_exists);
+      renderStorageFile("storageAccountState", storage.account_state_path, storage.account_state_exists);
     }
 
     async function saveConfig() {
@@ -1050,6 +1121,7 @@
       if (!token) return;
       const results = await Promise.allSettled([
         loadConfig(),
+        loadSystem(),
         loadClaudeAuth(),
         loadAccount(),
         loadCliWindows(),
@@ -1082,7 +1154,7 @@
       const reason = rejected.reason;
       if (reason?.status === 401) {
         setToken("");
-        setNotice("authNotice", "登录已过期", "error");
+        setNotice("authNotice", "未授权：管理员会话已过期，请重新登录，不需要重新初始化。", "error");
       }
       $("lastRefreshState").textContent = reason?.message || "刷新失败";
       $("lastRefreshState").className = "status error";
@@ -1145,6 +1217,12 @@
       $(valueId).textContent = `${status}${percent}`;
       const detail = [limit.reset_at ? `重置 ${limit.reset_at}` : "", limit.message || ""].filter(Boolean).join(" / ");
       $(detailId).textContent = detail || "-";
+    }
+
+    function renderStorageFile(prefix, filePath, exists) {
+      $(`${prefix}State`).textContent = exists ? "已创建" : "未创建";
+      $(`${prefix}State`).className = `status ${exists ? "ready" : "warning"}`;
+      $(`${prefix}Path`).textContent = filePath || "-";
     }
 
     function shortId(value) {

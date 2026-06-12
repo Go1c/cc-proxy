@@ -32,7 +32,13 @@ COPY public ./public
 /data
 ```
 
-然后设置服务环境变量：
+新版本启动时会自动检测可写的 `/data`，默认使用：
+
+```text
+/data/cc-proxy
+```
+
+仍然建议显式设置服务环境变量，方便排查：
 
 ```text
 CC_PROXY_DATA_DIR=/data/cc-proxy
@@ -48,6 +54,8 @@ CC_PROXY_DATA_DIR=/data/cc-proxy
 - Claude CLI 登录态，路径是 `/data/cc-proxy/claude-home`。
 
 不挂持久化卷的话，重建/重新部署后这些数据可能丢失。
+
+部署后可以在 `/admin` 的“存储 / 持久化”区域确认数据目录。正确状态应显示 `/data/cc-proxy`；如果显示 `.cc-proxy-data`，说明当前数据写在容器临时目录，重新部署后管理员和 API Key 可能会消失。
 
 ## 3. 最少环境变量
 
@@ -100,8 +108,9 @@ https://你的域名/admin
    - Claude command：一般保持自动探测，或填 `/src/node_modules/@anthropic-ai/claude-code-linux-x64/claude`。
    - Claude model：需要固定模型时再填。
 3. 在 Claude 登录认证区域点击开始登录。
-   - 日志里出现 Claude 登录链接后，在浏览器打开链接完成授权。
-   - Claude 要求输入 code/callback 时，把返回内容粘贴到认证输入框，点击提交给 Claude CLI。
+   - 默认登录参数是 `setup-token`，不是 `login`。
+   - 日志里出现 Claude 授权链接后，在浏览器打开链接完成授权。
+   - Claude 要求输入 code/callback/token 时，把返回内容粘贴到认证输入框，点击提交给 Claude CLI。
    - 完成后点击检查认证确认登录态写入 `/data/cc-proxy/claude-home`。
 4. 在 API Keys 区域创建下游调用用的 key。
 
@@ -161,6 +170,7 @@ curl https://你的域名/health
 常见问题：
 
 - `/admin` 500：镜像里缺 `public/admin.html`，检查 Dockerfile 是否有 `COPY public ./public`。
-- 重部署后管理员/key 丢失：没有挂载 `/data` 或没有设置 `CC_PROXY_DATA_DIR=/data/cc-proxy`。
-- Claude 未登录：进 `/admin` 的 Claude Auth 执行登录/检查，并确认 `/data/cc-proxy/claude-home` 在持久化卷里。
+- `unauthorized`：管理员会话失效，重新登录即可；不需要重新初始化管理员。服务重启/重部署会清掉内存会话 token，但不会清掉已经落盘的管理员账号。
+- 重部署后管理员/key 丢失：没有挂载 `/data`，或旧版本写到了容器内 `.cc-proxy-data`。升级后进 `/admin` 的“存储 / 持久化”确认数据目录是 `/data/cc-proxy`，然后重新创建一次管理员和 API Key，之后会跟随 Zeabur Volume 持久保存。
+- Claude 未登录：进 `/admin` 的 Claude Auth 执行登录/检查，确认登录参数是 `setup-token`，并确认 `/data/cc-proxy/claude-home` 在持久化卷里。
 - 下游 401：必须使用后台 API Keys 新建出来的 key。

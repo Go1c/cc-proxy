@@ -5,6 +5,11 @@
 > environment-variable keys or ConfigMap-only `dist` mounts. For the current
 > commercial-style deployment, use the admin backend, Dockerfile, `public/`, and
 > persistent `CC_PROXY_DATA_DIR` flow in the Zeabur guide.
+>
+> Current model: one server runs one `cc-proxy` service for one Claude account.
+> Admin users, downstream API Keys, runtime config, logs, Claude auth state, and
+> account usage are managed from `/admin` and persisted under `/data/cc-proxy`
+> on Zeabur. The old `CC_PROXY_API_KEY` style below is legacy-only.
 
 ## Current Deployment
 

@@ -9,6 +9,8 @@ import fs from "fs";
 import path from "path";
 import { spawn } from "child_process";
 import { resolveClaudeArgs, resolveClaudeCommand } from "./runner";
+import { resolveDataDir } from "./data-dir";
+import { ControlPlane, defaultRuntimeConfig } from "./control-plane";
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const SERVER_SCRIPT = path.join(PROJECT_ROOT, "dist", "server.js");
@@ -1418,6 +1420,58 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       }
     });
 
+    it("uses Zeabur /data volume as the default data directory when it is available", () => {
+      const resolved = resolveDataDir(
+        {},
+        "/src",
+        (candidate) => candidate === "/data"
+      );
+      assert.equal(resolved, "/data/cc-proxy");
+    });
+
+    it("uses CC_PROXY_DATA_DIR when explicitly configured", () => {
+      const resolved = resolveDataDir(
+        { CC_PROXY_DATA_DIR: "/custom/cc-proxy" },
+        "/src",
+        () => true
+      );
+      assert.equal(resolved, "/custom/cc-proxy");
+    });
+
+    it("falls back to a local data directory when /data is not available", () => {
+      const resolved = resolveDataDir(
+        {},
+        "/src",
+        () => false
+      );
+      assert.equal(resolved, "/src/.cc-proxy-data");
+    });
+
+    it("defaults Claude account auth to setup-token instead of interactive login", () => {
+      assert.equal(defaultRuntimeConfig().claude_auth_login_args, "setup-token");
+    });
+
+    it("migrates legacy Claude auth login args to setup-token", () => {
+      const dataDir = makeIsolatedDataDir("legacy-claude-auth-login-args");
+      const controlPlanePath = path.join(dataDir, "control-plane.json");
+      fs.mkdirSync(dataDir, { recursive: true });
+      fs.writeFileSync(
+        controlPlanePath,
+        JSON.stringify({
+          admin: null,
+          config: {
+            ...defaultRuntimeConfig(),
+            claude_auth_login_args: "login",
+          },
+          api_keys: [],
+        }),
+        "utf-8"
+      );
+
+      const controlPlane = new ControlPlane(controlPlanePath);
+      assert.equal(controlPlane.getConfig().claude_auth_login_args, "setup-token");
+    });
+
     it("runs Claude account login from the admin backend and exposes auth logs", async () => {
       const dataDir = makeIsolatedDataDir("admin-claude-auth-login");
       const argsPath = path.join(dataDir, "claude-auth-args.json");
@@ -1773,6 +1827,32 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       }
     });
 
+    it("shows storage diagnostics in the admin backend", async () => {
+      const dataDir = makeIsolatedDataDir("admin-storage-diagnostics");
+      const proc = await startTestServer(ZEABUR_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+      });
+      try {
+        const baseUrl = `http://localhost:${ZEABUR_PORT}`;
+        const adminToken = await bootstrapAdmin(baseUrl);
+
+        const res = await httpGet(`${baseUrl}/admin/system`, {
+          Authorization: `Bearer ${adminToken}`,
+        });
+        assert.equal(res.status, 200, res.body);
+        const body = JSON.parse(res.body);
+        assert.equal(body.storage.data_dir, dataDir);
+        assert.equal(body.storage.claude_home_dir, path.join(dataDir, "claude-home"));
+        assert.equal(body.storage.control_plane_path, path.join(dataDir, "control-plane.json"));
+        assert.equal(body.storage.control_plane_exists, true);
+        assert.equal(body.storage.audit_log_path, path.join(dataDir, "audit-log.json"));
+        assert.equal(body.storage.account_state_path, path.join(dataDir, "account-state.json"));
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+      }
+    });
+
     it("serves the administrator web console from /admin", async () => {
       const dataDir = makeIsolatedDataDir("admin-web-console");
       const proc = await startTestServer(ZEABUR_PORT, {
@@ -1792,6 +1872,8 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.match(res.body, /\/admin\/claude-auth\/input/);
         assert.match(res.body, /copyCreatedKeyButton/);
         assert.match(res.body, /logLevelFilter/);
+        assert.match(res.body, /storageDataDir/);
+        assert.match(res.body, /\/admin\/system/);
       } finally {
         proc.kill("SIGKILL");
         await sleep(300);
