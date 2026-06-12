@@ -521,7 +521,7 @@ function writeAnsiClaudeAuthCommand(argsPath: string): string {
     `#!/usr/bin/env node
 const fs = require("fs");
 fs.writeFileSync(${JSON.stringify(argsPath)}, JSON.stringify(process.argv.slice(2)), "utf8");
-process.stdout.write("\\x1b[38;5;246mOpen https://claude.example/oauth?code_challenge=abc123&state=xyz\\x1b[39m\\r\\n");
+process.stdout.write("\\x1b[38;5;246mOpen https://claude.example/oauth?code_challenge=abc123&redir\\r\\nect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcallback&state=xyz\\x1b[39m\\r\\n");
 process.stdout.write("\\x1b[2GPaste\\x1b[8Gcode\\x1b[13Ghere >\\r\\n");
 setTimeout(() => process.exit(0), 50);
 `,
@@ -1662,7 +1662,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.match(authBody.auth.log, /\x1b\[/);
         assert.equal(
           authBody.view.auth_url,
-          "https://claude.example/oauth?code_challenge=abc123&state=xyz"
+          "https://claude.example/oauth?code_challenge=abc123&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcallback&state=xyz"
         );
         assert.match(authBody.view.display_log, /Open https:\/\/claude\.example\/oauth/);
         assert.doesNotMatch(authBody.view.display_log, /\x1b\[/);

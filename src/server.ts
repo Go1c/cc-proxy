@@ -1504,8 +1504,29 @@ function cleanTerminalText(value: string): string {
 }
 
 function extractFirstHttpUrl(value: string): string | null {
-  const match = String(value || "").match(/https?:\/\/[^\s"'<>]+/);
-  return match ? match[0] : null;
+  const lines = String(value || "").split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const start = lines[i].search(/https?:\/\//);
+    if (start < 0) continue;
+    const first = lines[i].slice(start).match(/^[^\s"'<>]+/)?.[0] || "";
+    if (!first) continue;
+    let url = first;
+    for (let j = i + 1; j < lines.length; j++) {
+      const trimmed = lines[j].trimStart();
+      if (!trimmed) continue;
+      const part = trimmed.match(/^[^\s"'<>]+/)?.[0] || "";
+      if (!isUrlContinuation(part)) break;
+      url += part;
+    }
+    return url;
+  }
+  return null;
+}
+
+function isUrlContinuation(value: string): boolean {
+  if (!value || !/^[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]+$/.test(value)) return false;
+  if (/^[&?#/%=]/.test(value)) return true;
+  return /[=&%/?#]/.test(value);
 }
 
 // ---- HTTP server ----
