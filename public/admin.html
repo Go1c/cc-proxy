@@ -563,7 +563,6 @@
             <div class="actions" style="margin-top: 10px;">
               <button id="claudeAuthInputButton" type="button" disabled>提交给 Claude CLI</button>
               <button class="secondary" id="sendClaudeEnterButton" type="button" disabled>发送回车</button>
-              <button class="secondary" id="sendClaudeLoginCommandButton" type="button" disabled>发送 /login</button>
               <button class="secondary" id="copyClaudeAuthLogButton" type="button">复制日志</button>
             </div>
             <div class="auth-log-actions">
@@ -763,7 +762,7 @@
                 <input id="claudeSettingSources" placeholder="例如 project,local">
               </label>
               <label>登录参数
-                <input id="claudeAuthLoginArgs" placeholder="留空启动交互 Claude；可填 setup-token">
+                <input id="claudeAuthLoginArgs" placeholder="默认 auth login；一般不需要修改">
               </label>
               <label>认证检查参数
                 <input id="claudeAuthStatusArgs" placeholder="默认 --version">
@@ -1032,7 +1031,6 @@
       $("claudeAuthCheckButton").disabled = status === "running";
       $("claudeAuthInputButton").disabled = status !== "running";
       $("sendClaudeEnterButton").disabled = status !== "running";
-      $("sendClaudeLoginCommandButton").disabled = status !== "running";
       $("cancelClaudeAuthButton").disabled = status !== "running";
       const logText = [
         auth.command ? `$ ${auth.command} ${(auth.args || []).join(" ")}` : "",
@@ -1077,11 +1075,6 @@
 
     async function sendClaudeEnter() {
       $("claudeAuthInput").value = "";
-      await submitClaudeAuthInput();
-    }
-
-    async function sendClaudeLoginCommand() {
-      $("claudeAuthInput").value = "/login";
       await submitClaudeAuthInput();
     }
 
@@ -1388,7 +1381,6 @@
     $("cancelClaudeAuthButton").onclick = () => runAction(cancelClaudeAuth, "claudeAuthNotice");
     $("claudeAuthInputButton").onclick = () => runAction(submitClaudeAuthInput, "claudeAuthNotice");
     $("sendClaudeEnterButton").onclick = () => runAction(sendClaudeEnter, "claudeAuthNotice");
-    $("sendClaudeLoginCommandButton").onclick = () => runAction(sendClaudeLoginCommand, "claudeAuthNotice");
     $("copyClaudeAuthLogButton").onclick = () => copyText($("claudeAuthLog").textContent, "claudeAuthNotice");
     $("createKeyButton").onclick = () => runAction(createKey);
     $("copyCreatedKeyButton").onclick = () => copyText($("createdKey").dataset.value || "", "authNotice");

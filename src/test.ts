@@ -1488,11 +1488,11 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       assert.equal(resolved, "/src/.cc-proxy-data");
     });
 
-    it("defaults Claude account auth to the interactive Claude session", () => {
-      assert.equal(defaultRuntimeConfig().claude_auth_login_args, "");
+    it("defaults Claude account auth to the official auth login command", () => {
+      assert.equal(defaultRuntimeConfig().claude_auth_login_args, "auth login");
     });
 
-    it("migrates legacy Claude auth login args to the interactive Claude session", () => {
+    it("migrates legacy Claude auth login args to the official auth login command", () => {
       const dataDir = makeIsolatedDataDir("legacy-claude-auth-login-args");
       const controlPlanePath = path.join(dataDir, "control-plane.json");
       fs.mkdirSync(dataDir, { recursive: true });
@@ -1510,7 +1510,29 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       );
 
       const controlPlane = new ControlPlane(controlPlanePath);
-      assert.equal(controlPlane.getConfig().claude_auth_login_args, "");
+      assert.equal(controlPlane.getConfig().claude_auth_login_args, "auth login");
+    });
+
+    it("migrates the previous blank default Claude auth login args to auth login", () => {
+      const dataDir = makeIsolatedDataDir("blank-claude-auth-login-args");
+      const controlPlanePath = path.join(dataDir, "control-plane.json");
+      fs.mkdirSync(dataDir, { recursive: true });
+      fs.writeFileSync(
+        controlPlanePath,
+        JSON.stringify({
+          schema_version: 2,
+          admin: null,
+          config: {
+            ...defaultRuntimeConfig(),
+            claude_auth_login_args: "",
+          },
+          api_keys: [],
+        }),
+        "utf-8"
+      );
+
+      const controlPlane = new ControlPlane(controlPlanePath);
+      assert.equal(controlPlane.getConfig().claude_auth_login_args, "auth login");
     });
 
     it("keeps explicitly configured setup-token args after the control plane has migrated", () => {
@@ -1628,10 +1650,10 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       }
     });
 
-    it("starts the default interactive Claude login without a pseudo terminal and sends /login", async () => {
+    it("starts the default Claude auth login in a pseudo terminal without synthetic slash commands", async () => {
       const dataDir = makeIsolatedDataDir("admin-claude-auth-default-login");
-      const resultPath = path.join(dataDir, "claude-auth-default-login.json");
-      const fakeClaude = writeInteractiveClaudeAuthCommand(resultPath);
+      const argsPath = path.join(dataDir, "claude-auth-default-login.json");
+      const fakeClaude = writeTtyOnlyClaudeAuthCommand(argsPath);
       const proc = await startTestServer(ZEABUR_PORT, {
         CC_PROXY_DATA_DIR: dataDir,
         CLAUDE_COMMAND: fakeClaude,
@@ -1644,7 +1666,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
           `${baseUrl}/admin/config`,
           {
             claude_command: fakeClaude,
-            claude_auth_login_args: "",
+            claude_auth_login_args: "auth login",
           },
           { Authorization: `Bearer ${adminToken}` }
         );
@@ -1657,10 +1679,23 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         );
         assert.equal(started.status, 202, started.body);
 
-        const recorded = await waitForJsonFile(resultPath);
-        assert.ok(recorded, "Claude auth default /login input file was not written");
-        assert.equal(recorded.input, "/login");
-        assert.equal(recorded.HOME, path.join(dataDir, "claude-home"));
+        let authBody: any = null;
+        for (let i = 0; i < 20; i++) {
+          const auth = await httpGet(`${baseUrl}/admin/claude-auth`, {
+            Authorization: `Bearer ${adminToken}`,
+          });
+          assert.equal(auth.status, 200, auth.body);
+          authBody = JSON.parse(auth.body);
+          if (authBody.auth.status === "succeeded") break;
+          await sleep(50);
+        }
+        assert.equal(authBody.auth.status, "succeeded");
+        assert.match(authBody.auth.log, /TTY Claude login URL/);
+        assert.doesNotMatch(authBody.auth.log, /\/login/);
+        const recorded = JSON.parse(fs.readFileSync(argsPath, "utf-8"));
+        assert.deepEqual(recorded.args, ["auth", "login"]);
+        assert.equal(recorded.stdoutIsTTY, true);
+        assert.equal(recorded.stdinIsTTY, true);
       } finally {
         proc.kill("SIGKILL");
         await sleep(300);
@@ -2254,8 +2289,10 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.match(res.body, /deleteKey/);
         assert.match(res.body, /claudeAuthInput/);
         assert.match(res.body, /\/admin\/claude-auth\/input/);
-        assert.match(res.body, /sendClaudeLoginCommandButton/);
-        assert.match(res.body, /\/login/);
+        assert.match(res.body, /sendClaudeEnterButton/);
+        assert.match(res.body, /auth login/);
+        assert.doesNotMatch(res.body, /sendClaudeLoginCommandButton/);
+        assert.doesNotMatch(res.body, /发送 \/login/);
         assert.match(res.body, /cancelClaudeAuthButton/);
         assert.match(res.body, /changeAdminPasswordButton/);
         assert.match(res.body, /\/admin\/auth\/password/);

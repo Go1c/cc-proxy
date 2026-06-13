@@ -48,8 +48,8 @@ interface ControlPlaneState {
   api_keys: StoredApiKey[];
 }
 
-const CONTROL_PLANE_SCHEMA_VERSION = 2;
-const DEFAULT_CLAUDE_AUTH_LOGIN_ARGS = "";
+const CONTROL_PLANE_SCHEMA_VERSION = 3;
+const DEFAULT_CLAUDE_AUTH_LOGIN_ARGS = "auth login";
 
 export interface CreatedApiKey {
   id: string;
@@ -234,7 +234,12 @@ export class ControlPlane {
         ...defaultState.config,
         ...parsedConfig,
       });
-      if (schemaVersion < CONTROL_PLANE_SCHEMA_VERSION && parsedConfig.claude_auth_login_args === "setup-token") {
+      if (
+        schemaVersion < CONTROL_PLANE_SCHEMA_VERSION &&
+        (parsedConfig.claude_auth_login_args === "" ||
+          parsedConfig.claude_auth_login_args === "login" ||
+          parsedConfig.claude_auth_login_args === "setup-token")
+      ) {
         config.claude_auth_login_args = DEFAULT_CLAUDE_AUTH_LOGIN_ARGS;
       }
       return {

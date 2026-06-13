@@ -19,144 +19,38 @@ Public base URL:
 https://cc-proxy.zeabur.app
 ```
 
-Client API key:
+Create downstream API keys from `/admin`; do not use a shared `CC_PROXY_API_KEY` environment variable as the main credential path.
+
+Runtime configuration is admin-managed and persisted under `CC_PROXY_DATA_DIR`. In Zeabur, the only recommended service variable is:
 
 ```text
-CC_PROXY_API_KEY=<shared out of band>
+CC_PROXY_DATA_DIR=/data/cc-proxy
 ```
 
-Do not commit the real key. Configure it in Zeabur as an environment variable and use it locally as either `ANTHROPIC_API_KEY` or an `Authorization` header.
-
-Runtime environment variables:
+`CLAUDE_COMMAND` can be provided as a startup fallback if the image layout changes, but the admin console can also save it:
 
 ```text
-CLAUDE_CODE_OAUTH_TOKEN=<Claude Code OAuth token>
-CC_PROXY_API_KEY=<shared proxy API key>
 CLAUDE_COMMAND=/src/node_modules/@anthropic-ai/claude-code-linux-x64/claude
-CC_CLAUDE_MODEL=claude-sonnet-4-6
-CC_PERMISSION_MODE=acceptEdits
-CC_MAX_SESSIONS=10
 ```
 
-`CC_PERMISSION_MODE=acceptEdits` is required when `/v1/messages` should allow Claude Code to create or edit files in the session workspace. Without it, read-only validation can still work, but write/edit requests may be denied or silently skipped by Claude Code permissions.
-
-Optional isolation variable:
-
-```text
-CC_CLAUDE_SETTING_SOURCES=project,local
-```
-
-This forwards Claude Code's `--setting-sources` flag. Use it only when a machine has user-level Claude Code settings that should not affect the proxy runtime. Do not set it unless you have confirmed the runtime still has a valid `CLAUDE_CODE_OAUTH_TOKEN`; setting sources can change which local configuration files Claude Code reads, but it does not create authentication.
+Set model, permission mode, max CLI windows, idle timeout, turn timeout, and Claude auth arguments from `/admin`. `CC_PERMISSION_MODE=acceptEdits` is still the value to use when `/v1/messages` should allow Claude Code to create or edit files, but it should be saved in the admin runtime config instead of depending on Zeabur variables.
 
 Do not configure `CC_ANTHROPIC_API_KEY`, `CC_ANTHROPIC_BASE_URL`, `CC_ANTHROPIC_AUTH_HEADER`, `CC_ANTHROPIC_BETA`, or `CC_ANTHROPIC_VERSION` for this deployment. The goal is to use Claude Code OAuth/subscription quota through the real Claude Code CLI, not Anthropic API usage credits.
 
 ## Zeabur Claude Code OAuth Flow
 
-The OAuth login must be initiated from the server or Pod that will run Claude Code. A browser success page only proves the browser side succeeded; the CLI must receive the returned `code#state` and save credentials in the same runtime context.
+The OAuth login must be initiated from the server that will run Claude Code. A browser success page only proves the browser side succeeded; the CLI must receive the returned `code#state` and save credentials in the same runtime context.
 
-Fast path for the current Zeabur node:
+Use `/admin`:
 
-```bash
-ssh ubuntu@43.128.89.221
+1. Open `https://cc-proxy.zeabur.app/admin`.
+2. In runtime config, keep the default Claude login args as `auth login`.
+3. Click "开始登录" in the Claude auth panel.
+4. Open the OAuth URL shown in the log.
+5. Paste any returned code/callback/token into the auth input box, or press "发送回车" when the CLI is waiting for confirmation.
+6. Run the auth check from the same panel.
 
-NS=environment-6a2ad5e305a35017ba9066bb
-DEPLOY=service-6a2ad5ee16481d6693b3f1f5
-POD=$(sudo kubectl get pods -n "$NS" -o name | sed -n 's#pod/##p' | head -n 1)
-
-sudo kubectl exec -it -n "$NS" "$POD" -- sh -lc '
-  rm -rf /tmp/cc-oauth
-  mkdir -p /tmp/cc-oauth
-  chmod 700 /tmp/cc-oauth
-  HOME=/tmp/cc-oauth \
-    env -u CLAUDE_CODE_OAUTH_TOKEN \
-        -u ANTHROPIC_BASE_URL \
-        -u ANTHROPIC_AUTH_TOKEN \
-        -u ANTHROPIC_API_KEY \
-        -u ANTHROPIC_AUTH_HEADER \
-    /src/node_modules/@anthropic-ai/claude-code-linux-x64/claude auth login --claudeai
-'
-```
-
-Open the printed `https://claude.com/cai/oauth/authorize?...` URL in a local browser. If the browser shows a `code#state` value, paste it back into the waiting server terminal. After login succeeds, confirm the Pod account is using Claude subscription auth:
-
-```bash
-sudo kubectl exec -n "$NS" "$POD" -- sh -lc '
-  HOME=/tmp/cc-oauth \
-    env -u CLAUDE_CODE_OAUTH_TOKEN \
-        -u ANTHROPIC_BASE_URL \
-        -u ANTHROPIC_AUTH_TOKEN \
-        -u ANTHROPIC_API_KEY \
-        -u ANTHROPIC_AUTH_HEADER \
-    /src/node_modules/@anthropic-ai/claude-code-linux-x64/claude auth status --json
-'
-```
-
-Expected shape:
-
-```json
-{
-  "loggedIn": true,
-  "authMethod": "claude.ai",
-  "apiProvider": "firstParty",
-  "subscriptionType": "pro"
-}
-```
-
-Then generate the long-lived token:
-
-```bash
-sudo kubectl exec -it -n "$NS" "$POD" -- sh -lc '
-  HOME=/tmp/cc-oauth \
-    env -u CLAUDE_CODE_OAUTH_TOKEN \
-        -u ANTHROPIC_BASE_URL \
-        -u ANTHROPIC_AUTH_TOKEN \
-        -u ANTHROPIC_API_KEY \
-        -u ANTHROPIC_AUTH_HEADER \
-    /src/node_modules/@anthropic-ai/claude-code-linux-x64/claude setup-token
-'
-```
-
-`setup-token` may print a second browser OAuth URL. Complete that authorization too. The value to keep is the final long-lived token printed by `setup-token`, not the short `code#state` browser callback value.
-
-To make the token survive Zeabur rebuilds/redeploys, configure it in Zeabur service variables:
-
-```text
-CLAUDE_CODE_OAUTH_TOKEN=<long-lived token from claude setup-token>
-```
-
-Also keep these service variables in Zeabur:
-
-```text
-CLAUDE_COMMAND=/src/node_modules/@anthropic-ai/claude-code-linux-x64/claude
-CC_CLAUDE_MODEL=claude-sonnet-4-6
-CC_PERMISSION_MODE=acceptEdits
-CC_MAX_SESSIONS=10
-CC_PROXY_API_KEY=<shared proxy API key>
-```
-
-Do not put browser `code#state` values into Zeabur variables. They are one-time OAuth callback codes, not runtime credentials.
-
-For a one-off live Kubernetes patch after setting the Zeabur variable:
-
-```bash
-sudo kubectl set env -n "$NS" deploy/"$DEPLOY" \
-  CLAUDE_CODE_OAUTH_TOKEN='<long-lived token>' \
-  CLAUDE_COMMAND=/src/node_modules/@anthropic-ai/claude-code-linux-x64/claude \
-  CC_CLAUDE_MODEL=claude-sonnet-4-6 \
-  CC_PERMISSION_MODE=acceptEdits \
-  CC_MAX_SESSIONS=10 \
-  CC_ANTHROPIC_BETA- CC_ANTHROPIC_BASE_URL- CC_ANTHROPIC_API_KEY- CC_ANTHROPIC_AUTH_HEADER- CC_ANTHROPIC_VERSION-
-
-sudo kubectl rollout status -n "$NS" deploy/"$DEPLOY" --timeout=180s
-```
-
-Current Zeabur runtime patch:
-
-```text
-cc-proxy-dist ConfigMap -> /src/dist
-```
-
-Mount the full compiled `dist` directory. Do not mount only `/src/dist/server.js`; `server.js`, `runner.js`, `session-manager.js`, and `types.js` must come from the same build.
+Do not put browser `code#state` values into Zeabur variables. They are one-time OAuth callback codes, not runtime credentials. The persisted login state belongs under `/data/cc-proxy/claude-home`.
 
 ## How To Use
 
@@ -382,7 +276,7 @@ GET    /sessions/{id}
 DELETE /sessions/{id}
 ```
 
-`/sessions` endpoints require the proxy key when `CC_PROXY_API_KEY` is configured.
+`/sessions` endpoints require a proxy key from `/admin`. The legacy `CC_PROXY_API_KEY` environment fallback is still accepted when configured.
 
 ## Architecture
 
@@ -396,7 +290,7 @@ Zeabur public route
   v
 Node HTTP server (dist/server.js)
   |
-  +-- Auth gate (CC_PROXY_API_KEY)
+  +-- Auth gate (admin API keys; legacy CC_PROXY_API_KEY fallback)
   |
   +-- Anthropic compatibility adapter
   |     - validates /v1/messages JSON
@@ -417,7 +311,7 @@ Node HTTP server (dist/server.js)
   |
   +-- SessionManager
         - creates and tracks Claude Code sessions
-        - enforces CC_MAX_SESSIONS
+        - enforces the admin-managed max CLI window limit
         - reaps idle sessions
         - shuts down CLI processes on server exit
         |
@@ -451,10 +345,10 @@ Node HTTP server (dist/server.js)
 
 - Zeabur-compatible runtime on `PORT`.
 - Bundled Claude Code CLI resolution for macOS and Linux native optional packages.
-- Claude OAuth token support through `CLAUDE_CODE_OAUTH_TOKEN`.
+- Claude account auth through the admin-managed Claude CLI login flow under the persistent runtime HOME.
 - Public health endpoint: `GET /health`.
 - Persistent session API with max-session enforcement.
-- Idle session cleanup with `CC_IDLE_TIMEOUT_MS` and `CC_REAP_INTERVAL_MS`.
+- Idle session cleanup using admin-managed runtime config.
 - Graceful shutdown that kills managed Claude Code processes.
 - PreToolUse Read interception:
   - reads requested files from `DOWNSTREAM_ROOT`,
@@ -462,7 +356,7 @@ Node HTTP server (dist/server.js)
   - prevents path traversal out of downstream root,
   - preserves downstream bytes/content for billing-relevant reads.
 - Claude Code built-in tool execution, including `Read` and `Write`.
-- Optional Claude Code permission mode via `CC_PERMISSION_MODE`, including `acceptEdits` for write/edit validation.
+- Optional Claude Code permission mode via admin-managed runtime config, including `acceptEdits` for write/edit validation.
 - Anthropic-style `POST /v1/messages`:
   - accepts `x-api-key` and `Authorization: Bearer`,
   - emits `request-id` response headers and `request_id` on Anthropic-shaped errors,
@@ -476,9 +370,9 @@ Node HTTP server (dist/server.js)
   - supports client-supplied Anthropic `tools` through a real one-shot Claude Code MCP bridge,
   - emits `tool_use` and accepts follow-up `tool_result` to resume the original Claude Code turn,
   - supports temporary one-shot sessions and optional persistent sessions.
-- Optional model override via `CC_CLAUDE_MODEL`.
-- Optional permission-mode override via `CC_PERMISSION_MODE`.
-- Production deployment with `cc-proxy-dist` mounted over `/src/dist`, so all runtime modules match the local build.
+- Optional model override via admin-managed runtime config.
+- Optional permission-mode override via admin-managed runtime config.
+- Production deployment with the repository Dockerfile, including `dist/`, `public/`, and `node_modules/`.
 
 ## Completed Work
 
@@ -495,9 +389,9 @@ Node HTTP server (dist/server.js)
 - Added Anthropic-style `tool_use` / `tool_result` continuation support.
 - Added live SSE forwarding for the first `tool_use` turn and for the resumed `tool_result` answer.
 - Filtered Claude Code internal tool discovery events such as `ToolSearch` out of the client-supplied tool bridge, so only tool names declared by the Anthropic client are exposed back as Anthropic `tool_use` blocks.
-- Added `CC_CLAUDE_MODEL=claude-sonnet-4-6` CLI model override.
-- Added `CC_PERMISSION_MODE=acceptEdits` CLI permission override.
-- Set production `CC_MAX_SESSIONS=10`.
+- Added admin-managed CLI model override.
+- Added admin-managed `acceptEdits` CLI permission override.
+- Added admin-managed max CLI window limit.
 - Removed production `CC_ANTHROPIC_*` environment variables.
 - Fixed the Zeabur deployment mismatch where only `server.js` was mounted and the old image `runner.js` was still used.
 - Added local fake-Claude coverage for live stream chunks, multimodal native blocks, assistant history preservation, request model/effort args, cache metadata, request-id headers, client-supplied MCP tools, and tool edge cases.
@@ -510,8 +404,8 @@ Node HTTP server (dist/server.js)
 - `thinking.budget_tokens` uses an approximate Claude Code `--effort` mapping, not exact Anthropic thinking-token budget semantics.
 - Existing persistent sessions cannot change model, effort, or MCP tool configuration after the Claude Code process starts.
 - Official Anthropic response headers and every edge-case error shape are not fully reproduced beyond the implemented `request-id` and `request_id` fields.
-- There is no rate limiting beyond `CC_MAX_SESSIONS`.
-- There is no per-user key management; `CC_PROXY_API_KEY` is a single shared proxy key.
+- There is no request-rate limiting beyond the max CLI window concurrency limit.
+- API keys are managed in `/admin`, but per-key rate limits and quotas are not implemented yet.
 - The hook currently intercepts `Read`; writes happen in the Claude Code session workspace and are not mirrored back into `DOWNSTREAM_ROOT`.
 
 ## TODO
@@ -520,10 +414,10 @@ Node HTTP server (dist/server.js)
 - Re-test client-supplied tools in production after Claude subscription quota resets. The latest run proved the proxy no longer leaks Claude Code internal `ToolSearch` as a client tool, but full tool execution/resume could not be completed because Claude Code returned a five-hour session-limit 429.
 - Add broader production integration coverage for multi-tool and tool error cases.
 - Improve Anthropic-compatible response headers and edge-case error shapes beyond request IDs.
-- Add per-user or per-client API keys instead of one shared `CC_PROXY_API_KEY`.
-- Add explicit production rate limiting beyond `CC_MAX_SESSIONS`.
+- Add per-key request limits and usage grouping in the admin backend.
+- Add explicit production rate limiting beyond the max CLI window concurrency limit.
 - Decide how write/edit results should sync back to a real downstream workspace in a remote-agent architecture.
-- Add a repeatable production deployment script for the `cc-proxy-dist` ConfigMap patch.
+- Add a repeatable production deployment script for the Dockerfile-based Zeabur flow.
 - Add live production integration coverage for request-id headers, live streaming timing, model/effort args, and client-supplied MCP tools.
 
 ## Known Edge Cases
@@ -531,49 +425,20 @@ Node HTTP server (dist/server.js)
 - Very small image inputs can be rejected by the underlying Claude Code/API image processor. A normal 64x64 PNG image passed through `/v1/messages` and returned `Red` in production.
 - Claude Code reports high token counts because each Claude Code CLI request includes its own tool/runtime/system context. This is expected for the Claude Code OAuth path and is not the same as a minimal Anthropic API request.
 - Claude Code `usage.input_tokens` can look deceptively small while `cache_creation_input_tokens` and `cache_read_input_tokens` are large. For example, a real production tool validation turn reported `input_tokens=3`, `cache_creation_input_tokens=5818`, and `cache_read_input_tokens=17125`. Token auditing must include the cache fields, not just `input_tokens`.
-- `usage.total_cost_usd` is surfaced from Claude Code result events for visibility, but this deployment is authenticated by `CLAUDE_CODE_OAUTH_TOKEN`; do not add Anthropic API upstream credentials unless the billing model intentionally changes.
-- If local validation unexpectedly calls a remote proxy or custom Anthropic base URL, check user-level Claude Code settings and rerun with `CC_CLAUDE_SETTING_SOURCES=project,local` plus a valid `CLAUDE_CODE_OAUTH_TOKEN`.
+- `usage.total_cost_usd` is surfaced from Claude Code result events for visibility, but this deployment is authenticated by Claude CLI login state under the persistent runtime HOME; do not add Anthropic API upstream credentials unless the billing model intentionally changes.
+- If local validation unexpectedly calls a remote proxy or custom Anthropic base URL, check user-level Claude Code settings and use the admin-managed setting sources value to isolate project/local settings.
 
 ## Zeabur Deployment Notes
 
-Build locally before updating the runtime ConfigMap:
+Deploy from Git through Zeabur using the repository Dockerfile. The image must include `dist/`, `public/`, and `node_modules/`; do not mount only `server.js` or an old partial `dist` tree over the container.
+
+Before pushing a release, verify locally:
 
 ```bash
 npm run build
 ```
 
-Upload the full `dist` directory as a ConfigMap and mount it over `/src/dist`:
-
-```bash
-tar -czf /tmp/cc-proxy-dist.tgz -C . dist
-scp /tmp/cc-proxy-dist.tgz ubuntu@43.128.89.221:/tmp/cc-proxy-dist.tgz
-```
-
-On the Zeabur host:
-
-```bash
-NS=environment-6a2ad5e305a35017ba9066bb
-DEPLOY=service-6a2ad5ee16481d6693b3f1f5
-
-rm -rf /tmp/cc-proxy-dist-upload
-mkdir -p /tmp/cc-proxy-dist-upload
-tar -xzf /tmp/cc-proxy-dist.tgz -C /tmp/cc-proxy-dist-upload
-find /tmp/cc-proxy-dist-upload/dist -name '._*' -delete
-
-sudo kubectl create configmap cc-proxy-dist -n "$NS" \
-  --from-file=/tmp/cc-proxy-dist-upload/dist \
-  -o yaml --dry-run=client | sudo kubectl apply -f -
-
-sudo kubectl patch deploy -n "$NS" "$DEPLOY" --type=json -p '[
-  {"op":"replace","path":"/spec/template/spec/containers/0/volumeMounts/1","value":{"name":"cc-proxy-dist","mountPath":"/src/dist","readOnly":true}},
-  {"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"cc-proxy-dist","configMap":{"name":"cc-proxy-dist"}}}
-]'
-
-sudo kubectl rollout restart -n "$NS" deploy/"$DEPLOY"
-sudo kubectl rollout status -n "$NS" deploy/"$DEPLOY" --timeout=150s
-```
-
-After rollout, verify the key runtime hashes:
+After Zeabur deploys the pushed commit, verify the runtime has the expected files:
 
 ```bash
 POD=$(sudo kubectl get pods -n "$NS" \
@@ -581,7 +446,7 @@ POD=$(sudo kubectl get pods -n "$NS" \
   -o jsonpath='{.items[0].metadata.name}')
 
 sudo kubectl exec -n "$NS" "$POD" -- sh -lc \
-  'sha256sum /src/dist/server.js /src/dist/runner.js /src/dist/session-manager.js /src/dist/client-tool-bridge.js /src/dist/client-tool-mcp-server.js /src/dist/types.js'
+  'test -f /src/dist/server.js && test -f /src/public/admin.html && test -x /src/node_modules/.bin/claude'
 ```
 
 ## Verification
@@ -590,7 +455,7 @@ Current production status as of 2026-06-12:
 
 ```text
 GET /health -> 200, max_sessions=10
-CLAUDE_CODE_OAUTH_TOKEN -> refreshed with a 1-year Claude Code OAuth token; latest Pod reads token length 108 and prefix sk-ant-oat
+Claude auth -> managed from /admin and persisted under /data/cc-proxy/claude-home
 POST /v1/messages text -> 200, request-id and x-cc-cli-session-id present, LIVE_TEXT_OK returned
 POST /v1/messages stream:true -> 200, text/event-stream, request-id present, live content_block_delta events present, STREAM_REAL_OK returned
 POST /v1/messages long game-development context -> 200, LONG_GAME_CONTEXT_OK returned
@@ -602,7 +467,7 @@ Current local real-Claude validation status as of 2026-06-12:
 ```text
 Isolated local server with real Claude Code CLI starts and serves /health
 POST /v1/messages invalid messages -> 400, request-id header matches body request_id
-POST /v1/messages inference -> depends on local CLAUDE_CODE_OAUTH_TOKEN and Claude subscription session quota
+POST /v1/messages inference -> depends on local Claude CLI login state and Claude subscription session quota
 ```
 
 Previous verified production run on 2026-06-12 before the token refresh issue:
