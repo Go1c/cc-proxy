@@ -1099,6 +1099,62 @@ process.stdin.on("data", (chunk) => {
   return scriptPath;
 }
 
+function writeMessageRecordingClaudeCommand(recordPath: string): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `record-messages-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+const fs = require("fs");
+process.stdin.setEncoding("utf8");
+let buffer = "";
+const messages = [];
+let timer = null;
+function flush() {
+  fs.writeFileSync(${JSON.stringify(recordPath)}, JSON.stringify(messages), "utf8");
+  const summary = messages.map((input) => {
+    const content = Array.isArray(input.message?.content) ? input.message.content : [];
+    return content.map((block) => block?.type || "unknown").join(",");
+  }).join("|");
+  process.stdout.write(JSON.stringify({
+    type: "assistant",
+    session_id: "fake-cli-session",
+    message: { role: "assistant", content: [{ type: "text", text: "MESSAGE_TYPES:" + summary }] }
+  }) + "\\n");
+  process.stdout.write(JSON.stringify({
+    type: "result",
+    session_id: "fake-cli-session",
+    result: "MESSAGE_TYPES:" + summary,
+    usage: {
+      input_tokens: 3,
+      output_tokens: 4,
+      cache_creation_input_tokens: 5,
+      cache_read_input_tokens: 6
+    },
+    total_cost_usd: 0.0123,
+    duration_ms: 10,
+    num_turns: 1,
+    is_error: false
+  }) + "\\n");
+}
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let idx;
+  while ((idx = buffer.indexOf("\\n")) >= 0) {
+    const line = buffer.slice(0, idx).trim();
+    buffer = buffer.slice(idx + 1);
+    if (!line) continue;
+    messages.push(JSON.parse(line));
+  }
+  clearTimeout(timer);
+  timer = setTimeout(flush, 25);
+});
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
 function writeLongContextInspectingClaudeCommand(): string {
   const scriptPath = path.join(TEST_WORKSPACE, `long-context-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
   fs.writeFileSync(
@@ -3046,6 +3102,137 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.match(String(second.headers["content-type"]), /^text\/event-stream/);
         assert.match(second.body, /CLIENT_TOOL_RESULT:Switch docked budget/);
         assert.match(second.body, /event: message_stop/);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("passes completed Anthropic tool history to Claude Code as native stream-json blocks", async () => {
+      const dataDir = makeIsolatedDataDir("completed-tool-history");
+      const recordPath = path.join(dataDir, "claude-messages.json");
+      const fakeClaude = writeMessageRecordingClaudeCommand(recordPath);
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            messages: [
+              {
+                role: "user",
+                content: "Use lookup_frame_budget.",
+              },
+              {
+                role: "assistant",
+                content: [
+                  {
+                    type: "tool_use",
+                    id: "toolu_completed_001",
+                    name: "lookup_frame_budget",
+                    input: { platform: "switch" },
+                  },
+                ],
+              },
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: "toolu_completed_001",
+                    content: "Switch handheld budget: 16.67ms.",
+                  },
+                  {
+                    type: "text",
+                    text: "Use that result in the final answer.",
+                  },
+                ],
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200, res.body);
+        const recorded = await waitForJsonFile(recordPath);
+        assert.ok(recorded, "Claude input was not recorded");
+        assert.deepEqual(
+          recorded.map((input: any) => input.message.content.map((block: any) => block.type)),
+          [["text"], ["tool_use"], ["tool_result", "text"]]
+        );
+        assert.deepEqual(recorded[1].message.content[0], {
+          type: "tool_use",
+          id: "toolu_completed_001",
+          name: "lookup_frame_budget",
+          input: { platform: "switch" },
+        });
+        assert.deepEqual(recorded[2].message.content[0], {
+          type: "tool_result",
+          tool_use_id: "toolu_completed_001",
+          content: "Switch handheld budget: 16.67ms.",
+        });
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("lets Claude Code handle incomplete Anthropic tool history instead of rejecting it in the proxy", async () => {
+      const dataDir = makeIsolatedDataDir("incomplete-tool-history");
+      const recordPath = path.join(dataDir, "claude-messages.json");
+      const fakeClaude = writeMessageRecordingClaudeCommand(recordPath);
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            messages: [
+              {
+                role: "user",
+                content: "Use the tool.",
+              },
+              {
+                role: "assistant",
+                content: [
+                  {
+                    type: "tool_use",
+                    id: "toolu_missing_result_001",
+                    name: "lookup_frame_budget",
+                    input: { platform: "switch" },
+                  },
+                ],
+              },
+              {
+                role: "user",
+                content: "Continue without a tool result.",
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200, res.body);
+        const recorded = await waitForJsonFile(recordPath);
+        assert.ok(recorded, "Claude input was not recorded");
+        assert.deepEqual(
+          recorded.map((input: any) => input.message.content.map((block: any) => block.type)),
+          [["text"], ["tool_use"], ["text"]]
+        );
+        assert.deepEqual(recorded[1].message.content[0], {
+          type: "tool_use",
+          id: "toolu_missing_result_001",
+          name: "lookup_frame_budget",
+          input: { platform: "switch" },
+        });
       } finally {
         proc.kill("SIGKILL");
         await sleep(300);
