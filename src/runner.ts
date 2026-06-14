@@ -36,6 +36,7 @@ interface PendingTurn {
   reject: (e: Error) => void;
   timer: NodeJS.Timeout;
   thinkingBlocks: ClaudeContentBlock[];
+  activeThinkingBlocks: Map<number, ClaudeContentBlock>;
   lastAssistantContent: ClaudeContentBlock[];
   onStreamEvent?: (event: any, raw: any) => void;
 }
@@ -50,6 +51,8 @@ export interface ClaudeRunnerOptions {
   mcpConfig?: string;
   strictMcpConfig?: boolean;
   allowedTools?: string[];
+  disallowedTools?: string[];
+  tools?: string;
 }
 
 export interface TurnCallbacks {
@@ -128,6 +131,12 @@ export function resolveClaudeArgs(options: ClaudeRunnerOptions = {}): string[] {
   if (options.allowedTools && options.allowedTools.length > 0) {
     args.push("--allowedTools", options.allowedTools.join(","));
   }
+  if (options.disallowedTools && options.disallowedTools.length > 0) {
+    args.push("--disallowedTools", options.disallowedTools.join(","));
+  }
+  if (options.tools !== undefined) {
+    args.push("--tools", options.tools);
+  }
   return args;
 }
 
@@ -202,6 +211,7 @@ export class ClaudeRunner extends EventEmitter {
         reject,
         timer,
         thinkingBlocks: [],
+        activeThinkingBlocks: new Map(),
         lastAssistantContent: [],
         onStreamEvent: callbacks.onStreamEvent,
       };
@@ -259,6 +269,7 @@ export class ClaudeRunner extends EventEmitter {
       this.cliSessionId = obj.session_id;
     }
     if (obj.type === "stream_event" && obj.event) {
+      this.captureThinkingStreamEvent(obj.event);
       this.pending?.onStreamEvent?.(obj.event, obj);
     }
     if (obj.type === "assistant") {
@@ -278,6 +289,42 @@ export class ClaudeRunner extends EventEmitter {
       if (block.type === "thinking") {
         this.pending.thinkingBlocks.push(block);
       }
+    }
+  }
+
+  private captureThinkingStreamEvent(event: any): void {
+    if (!this.pending || !event || typeof event !== "object") return;
+    const index = typeof event.index === "number" ? event.index : null;
+    if (event.type === "content_block_start" && index !== null) {
+      const block = event.content_block;
+      if (block?.type === "thinking" || block?.type === "redacted_thinking") {
+        this.pending.activeThinkingBlocks.set(index, { ...block });
+      }
+      return;
+    }
+
+    if (event.type === "content_block_delta" && index !== null) {
+      const block = this.pending.activeThinkingBlocks.get(index);
+      if (!block) return;
+      const delta = event.delta || {};
+      if (delta.type === "thinking_delta") {
+        block.thinking = `${typeof block.thinking === "string" ? block.thinking : ""}${delta.thinking || ""}`;
+      } else if (delta.type === "signature_delta" && typeof delta.signature === "string") {
+        block.signature = delta.signature;
+      } else if (
+        delta.type === "redacted_thinking_delta" &&
+        typeof delta.data === "string"
+      ) {
+        block.data = `${typeof block.data === "string" ? block.data : ""}${delta.data}`;
+      }
+      return;
+    }
+
+    if (event.type === "content_block_stop" && index !== null) {
+      const block = this.pending.activeThinkingBlocks.get(index);
+      if (!block) return;
+      this.pending.activeThinkingBlocks.delete(index);
+      this.pending.thinkingBlocks.push(block);
     }
   }
 
@@ -389,8 +436,29 @@ function mergeThinkingBlocks(
   thinkingBlocks: ClaudeContentBlock[],
   finalContent: ClaudeContentBlock[]
 ): ClaudeContentBlock[] {
-  if (finalContent.some((block) => block.type === "thinking")) {
-    return finalContent;
+  const finalBlocks = dedupeThinkingBlocks(finalContent);
+  if (finalBlocks.some(isReasoningBlock)) {
+    return finalBlocks;
   }
-  return [...thinkingBlocks, ...finalContent];
+  return dedupeThinkingBlocks([...thinkingBlocks, ...finalBlocks]);
+}
+
+function isReasoningBlock(block: ClaudeContentBlock): boolean {
+  return block.type === "thinking" || block.type === "redacted_thinking";
+}
+
+function dedupeThinkingBlocks(blocks: ClaudeContentBlock[]): ClaudeContentBlock[] {
+  const seen = new Set<string>();
+  return blocks.filter((block) => {
+    if (!isReasoningBlock(block)) return true;
+    const key = JSON.stringify({
+      type: block.type,
+      thinking: block.thinking,
+      signature: block.signature,
+      data: block.data,
+    });
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }

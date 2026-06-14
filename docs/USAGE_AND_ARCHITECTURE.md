@@ -221,7 +221,7 @@ Thinking requests:
 }
 ```
 
-For new `/v1/messages` sessions, `thinking.budget_tokens` is mapped approximately to Claude Code `--effort`: `low`, `medium`, `high`, `xhigh`, or `max`. This is not the same as Anthropic's exact thinking-token budget API; it is the closest stable Claude Code CLI control exposed here.
+For new `/v1/messages` sessions, `thinking.budget_tokens` is mapped approximately to Claude Code `--effort`: `high`, `xhigh`, or `max`. This is not the same as Anthropic's exact thinking-token budget API; it is the closest stable Claude Code CLI control exposed here. Low thinking budgets are intentionally raised to `high` so Claude Code can return signature-compatible thinking blocks.
 
 Request `model`:
 
@@ -235,9 +235,19 @@ For new `/v1/messages` sessions, the request `model` is passed to Claude Code as
 
 ### Persistent cache sessions
 
-By default, `/v1/messages` creates a temporary Claude Code session for one request and closes it after the turn.
+By default, `/v1/messages` stays Anthropic-compatible and stateless: a standard request creates a one-shot Claude Code process and closes it after the turn. This preserves behavior and signature compatibility for generic API compatibility tests.
 
-To keep a session alive for prompt-cache reuse, send:
+For deployments that prefer inferred cache reuse over strict stateless compatibility, set:
+
+```bash
+CC_PROXY_AUTO_SESSION_AFFINITY=1
+```
+
+With that opt-in enabled, standard non-tool requests are kept in a warm Claude Code session and automatically reused for the same inferred conversation while it remains ready. The automatic affinity key is derived from the client API key, model, thinking effort, system prompt, and first user message.
+
+When a warm session is reused, the proxy does not replay the already-delivered history into the persistent Claude Code process. It tracks the user turns already sent to that process and forwards only the new suffix from the Anthropic-style full-history request, skipping assistant history that Claude Code already generated.
+
+For precise client-controlled binding, send:
 
 ```http
 x-cc-keep-session: true
@@ -255,6 +265,10 @@ Send the next request with:
 ```http
 x-cc-session-id: <proxy session id>
 ```
+
+`x-cc-session-id` is still the most reliable option when the downstream client has its own conversation identifier. If the client starts a new conversation with a different first user message, the proxy creates a separate warm session instead of mixing unrelated conversations.
+
+Client-supplied Anthropic `tools` are excluded from automatic warm-session reuse. They still use one-shot Claude Code sessions because the per-request MCP bridge must be attached when the Claude Code process starts and then torn down after the `tool_result` continuation.
 
 Close the session when done:
 
@@ -369,7 +383,8 @@ Node HTTP server (dist/server.js)
   - maps request `thinking.budget_tokens` approximately to Claude Code `--effort` for new sessions,
   - supports client-supplied Anthropic `tools` through a real one-shot Claude Code MCP bridge,
   - emits `tool_use` and accepts follow-up `tool_result` to resume the original Claude Code turn,
-  - supports temporary one-shot sessions and optional persistent sessions.
+  - automatically reuses warm Claude Code sessions for standard inferred conversations,
+  - supports explicit persistent sessions via `x-cc-session-id`.
 - Optional model override via admin-managed runtime config.
 - Optional permission-mode override via admin-managed runtime config.
 - Production deployment with the repository Dockerfile, including `dist/`, `public/`, and `node_modules/`.
@@ -389,6 +404,7 @@ Node HTTP server (dist/server.js)
 - Added Anthropic-style `tool_use` / `tool_result` continuation support.
 - Added live SSE forwarding for the first `tool_use` turn and for the resumed `tool_result` answer.
 - Filtered Claude Code internal tool discovery events such as `ToolSearch` out of the client-supplied tool bridge, so only tool names declared by the Anthropic client are exposed back as Anthropic `tool_use` blocks.
+- Added automatic warm-session affinity for standard `/v1/messages` clients, improving prompt-cache reuse without requiring custom session headers.
 - Added admin-managed CLI model override.
 - Added admin-managed `acceptEdits` CLI permission override.
 - Added admin-managed max CLI window limit.

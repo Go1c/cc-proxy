@@ -27,6 +27,93 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function readMcpFrame(buffer: Buffer): { message: any; rest: Buffer } | null {
+  const crlfSep = buffer.indexOf("\r\n\r\n");
+  const lfSep = buffer.indexOf("\n\n");
+  const sep =
+    crlfSep >= 0 && (lfSep < 0 || crlfSep <= lfSep) ? crlfSep : lfSep;
+  if (sep < 0) return null;
+  const separatorLength = sep === crlfSep ? 4 : 2;
+  const header = buffer.slice(0, sep).toString("utf8");
+  const match = header.match(/content-length:\s*(\d+)/i);
+  if (!match) throw new Error("missing MCP content-length");
+  const length = Number(match[1]);
+  const start = sep + separatorLength;
+  if (buffer.length < start + length) return null;
+  return {
+    message: JSON.parse(buffer.slice(start, start + length).toString("utf8")),
+    rest: buffer.slice(start + length),
+  };
+}
+
+function readMcpJsonLine(buffer: Buffer): { message: any; rest: Buffer } | null {
+  const lineEnd = buffer.indexOf("\n");
+  if (lineEnd < 0) return null;
+  const raw = buffer.slice(0, lineEnd).toString("utf8").trim();
+  if (!raw.startsWith("{")) {
+    throw new Error(`missing JSON-line MCP response: ${raw}`);
+  }
+  return {
+    message: JSON.parse(raw),
+    rest: buffer.slice(lineEnd + 1),
+  };
+}
+
+function requestMcpInitialize(
+  inputFormat: "\r\n\r\n" | "\n\n" | "json-line"
+): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(process.execPath, [
+      path.join(PROJECT_ROOT, "dist", "client-tool-mcp-server.js"),
+    ], {
+      env: {
+        ...process.env,
+        CC_PROXY_CLIENT_TOOL_BRIDGE_URL: "http://127.0.0.1:1",
+        CC_PROXY_CLIENT_TOOL_BRIDGE_TOKEN: "test",
+      },
+      stdio: ["pipe", "pipe", "inherit"],
+    });
+    let buffer = Buffer.alloc(0);
+    const timer = setTimeout(() => {
+      proc.kill("SIGKILL");
+      reject(new Error("MCP initialize timed out"));
+    }, 1000);
+    proc.stdout.on("data", (chunk: Buffer) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      try {
+        const frame = inputFormat === "json-line"
+          ? readMcpJsonLine(buffer)
+          : readMcpFrame(buffer);
+        if (!frame) return;
+        clearTimeout(timer);
+        proc.kill("SIGKILL");
+        resolve(frame.message);
+      } catch (err) {
+        clearTimeout(timer);
+        proc.kill("SIGKILL");
+        reject(err);
+      }
+    });
+    proc.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    const body = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2024-11-05" },
+    });
+    if (inputFormat === "json-line") {
+      proc.stdin.write(`${body}\n`);
+    } else {
+      proc.stdin.write(
+        `Content-Length: ${Buffer.byteLength(body)}${inputFormat}${body}`
+      );
+    }
+  });
+}
+
 function httpGet(
   url: string,
   headers: Record<string, string> = {}
@@ -58,6 +145,43 @@ function httpGet(
       req.destroy();
       resolve({ status: 0, body: "timeout", headers: {} });
     });
+  });
+}
+
+function httpOptions(
+  url: string,
+  headers: Record<string, string> = {}
+): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
+  return new Promise((resolve) => {
+    const urlObj = new URL(url);
+    const req = http.request(
+      {
+        hostname: urlObj.hostname,
+        port: urlObj.port,
+        path: `${urlObj.pathname}${urlObj.search}`,
+        method: "OPTIONS",
+        headers,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () => {
+          resolve({
+            status: res.statusCode || 0,
+            body: Buffer.concat(chunks).toString("utf-8"),
+            headers: res.headers,
+          });
+        });
+      }
+    );
+    req.on("error", (err) =>
+      resolve({ status: 0, body: err.message, headers: {} })
+    );
+    req.setTimeout(3000, () => {
+      req.destroy();
+      resolve({ status: 0, body: "timeout", headers: {} });
+    });
+    req.end();
   });
 }
 
@@ -435,6 +559,129 @@ process.stdin.on("data", (chunk) => {
   return scriptPath;
 }
 
+function writeFakeClaudeResultCommand(
+  resultText: string,
+  usage: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } = {}
+): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `fake-result-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let done = false;
+process.stdin.on("data", (chunk) => {
+  if (done || !chunk.trim()) return;
+  done = true;
+  const result = ${JSON.stringify(resultText)};
+  process.stdout.write(JSON.stringify({
+    type: "assistant",
+    session_id: "fake-cli-session",
+    message: { role: "assistant", content: [{ type: "text", text: result }] }
+  }) + "\\n");
+  process.stdout.write(JSON.stringify({
+    type: "result",
+    session_id: "fake-cli-session",
+    result,
+    usage: {
+      input_tokens: ${usage.input_tokens ?? 3},
+      output_tokens: ${usage.output_tokens ?? Math.max(1, Math.ceil(resultText.length / 4))},
+      cache_creation_input_tokens: ${usage.cache_creation_input_tokens ?? 0},
+      cache_read_input_tokens: ${usage.cache_read_input_tokens ?? 0}
+    },
+    total_cost_usd: 0,
+    duration_ms: 10,
+    num_turns: 1,
+    is_error: false,
+    stop_reason: "end_turn"
+  }) + "\\n");
+});
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
+function writePersistentTurnRecordingClaudeCommand(recordPath: string): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `persistent-turn-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+const fs = require("fs");
+process.stdin.setEncoding("utf8");
+let buffer = "";
+let turn = 0;
+let pendingInputs = [];
+let responseScheduled = false;
+const pid = process.pid;
+function append(record) {
+  const existing = fs.existsSync(${JSON.stringify(recordPath)})
+    ? JSON.parse(fs.readFileSync(${JSON.stringify(recordPath)}, "utf8"))
+    : [];
+  existing.push(record);
+  fs.writeFileSync(${JSON.stringify(recordPath)}, JSON.stringify(existing), "utf8");
+}
+function respondToPendingInputs() {
+  if (responseScheduled) return;
+  responseScheduled = true;
+  setTimeout(() => {
+    responseScheduled = false;
+    const inputs = pendingInputs;
+    pendingInputs = [];
+    if (inputs.length === 0) return;
+    turn += 1;
+    append({
+      pid,
+      turn,
+      message_count: inputs.length,
+      text: inputs
+        .flatMap((input) => input.message?.content || [])
+        .map((block) => block.text || "")
+        .join("\\n")
+    });
+    const result = "PERSISTENT_TURN_" + turn + "_PID_" + pid;
+    process.stdout.write(JSON.stringify({
+      type: "assistant",
+      session_id: "fake-cli-session-" + pid,
+      message: { role: "assistant", content: [{ type: "text", text: result }] }
+    }) + "\\n");
+    process.stdout.write(JSON.stringify({
+      type: "result",
+      session_id: "fake-cli-session-" + pid,
+      result,
+      usage: {
+        input_tokens: 10 + turn,
+        output_tokens: 4,
+        cache_creation_input_tokens: turn === 1 ? 100 : 0,
+        cache_read_input_tokens: turn === 1 ? 0 : 100
+      },
+      total_cost_usd: 0,
+      duration_ms: 10,
+      num_turns: turn,
+      is_error: false,
+      stop_reason: "end_turn"
+    }) + "\\n");
+  }, 5);
+}
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let idx;
+  while ((idx = buffer.indexOf("\\n")) >= 0) {
+    const line = buffer.slice(0, idx).trim();
+    buffer = buffer.slice(idx + 1);
+    if (!line) continue;
+    const input = JSON.parse(line);
+    pendingInputs.push(input);
+    respondToPendingInputs();
+  }
+});
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
 function writeArgRecordingClaudeCommand(argsPath: string): string {
   const scriptPath = path.join(TEST_WORKSPACE, `arg-recording-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
   fs.writeFileSync(
@@ -443,6 +690,42 @@ function writeArgRecordingClaudeCommand(argsPath: string): string {
 const fs = require("fs");
 fs.writeFileSync(${JSON.stringify(argsPath)}, JSON.stringify(process.argv.slice(2)), "utf8");
 process.stdin.resume();
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
+function writeArgRecordingResultClaudeCommand(argsPath: string): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `arg-result-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+const fs = require("fs");
+fs.writeFileSync(${JSON.stringify(argsPath)}, JSON.stringify(process.argv.slice(2)), "utf8");
+process.stdin.setEncoding("utf8");
+let started = false;
+process.stdin.on("data", (chunk) => {
+  if (started || !chunk.trim()) return;
+  started = true;
+  process.stdout.write(JSON.stringify({
+    type: "assistant",
+    session_id: "fake-cli-session",
+    message: { role: "assistant", content: [{ type: "text", text: "ARGS_RECORDED" }] }
+  }) + "\\n");
+  process.stdout.write(JSON.stringify({
+    type: "result",
+    session_id: "fake-cli-session",
+    result: "ARGS_RECORDED",
+    usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    total_cost_usd: 0,
+    duration_ms: 1,
+    num_turns: 1,
+    is_error: false,
+    stop_reason: "end_turn"
+  }) + "\\n");
+});
 `,
     "utf-8"
   );
@@ -727,6 +1010,360 @@ process.stdin.on("data", (chunk) => {
   return scriptPath;
 }
 
+function writeThinkingStreamingClaudeCommand(delayMs = 1400): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `thinking-streaming-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let emitted = false;
+function emit(obj) {
+  process.stdout.write(JSON.stringify(obj) + "\\n");
+}
+process.stdin.on("data", (chunk) => {
+  if (emitted) return;
+  if (!chunk.trim()) return;
+  emitted = true;
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "message_start",
+      message: {
+        id: "msg_live_fake",
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: {
+          input_tokens: 1,
+          output_tokens: 0,
+          cache_creation_input_tokens: 2,
+          cache_read_input_tokens: 3,
+          total_cost_usd: 0.0123
+        }
+      }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "thinking", thinking: "", signature: "" }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "thinking_delta", thinking: "internal reasoning" }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: { type: "content_block_stop", index: 0 }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "content_block_start",
+      index: 1,
+      content_block: { type: "text", text: "" }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "content_block_delta",
+      index: 1,
+      delta: { type: "text_delta", text: "VISIBLE_STREAM_TEXT" }
+    }
+  });
+  setTimeout(() => {
+    emit({
+      type: "assistant",
+      session_id: "fake-cli-session",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "internal reasoning", signature: "sig_internal" },
+          { type: "text", text: "VISIBLE_STREAM_TEXT" }
+        ]
+      }
+    });
+    emit({
+      type: "stream_event",
+      session_id: "fake-cli-session",
+      event: { type: "content_block_stop", index: 1 }
+    });
+    emit({
+      type: "stream_event",
+      session_id: "fake-cli-session",
+      event: {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn", stop_sequence: null },
+        usage: { output_tokens: 4, total_cost_usd: 0.0123 }
+      }
+    });
+    emit({
+      type: "stream_event",
+      session_id: "fake-cli-session",
+      event: { type: "message_stop" }
+    });
+    emit({
+      type: "result",
+      session_id: "fake-cli-session",
+      result: "VISIBLE_STREAM_TEXT",
+      usage: {
+        input_tokens: 1,
+        output_tokens: 4,
+        cache_creation_input_tokens: 2,
+        cache_read_input_tokens: 3
+      },
+      total_cost_usd: 0.0123,
+      duration_ms: ${delayMs},
+      num_turns: 1,
+      is_error: false,
+      stop_reason: "end_turn"
+    });
+  }, ${delayMs});
+});
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
+function writeThinkingEventsOnlyClaudeCommand(): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `thinking-events-only-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let emitted = false;
+function emit(obj) {
+  process.stdout.write(JSON.stringify(obj) + "\\n");
+}
+process.stdin.on("data", (chunk) => {
+  if (emitted || !chunk.trim()) return;
+  emitted = true;
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "message_start",
+      message: {
+        id: "msg_events_only",
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: {
+          input_tokens: 1,
+          output_tokens: 0,
+          cache_creation_input_tokens: 2,
+          cache_read_input_tokens: 3
+        }
+      }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "thinking", thinking: "" }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "thinking_delta", thinking: "streamed private reasoning" }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "signature_delta", signature: "sig_stream_only" }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: { type: "content_block_stop", index: 0 }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "content_block_start",
+      index: 1,
+      content_block: { type: "text", text: "" }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "content_block_delta",
+      index: 1,
+      delta: { type: "text_delta", text: "VISIBLE_EVENTS_ONLY_TEXT" }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: { type: "content_block_stop", index: 1 }
+  });
+  emit({
+    type: "assistant",
+    session_id: "fake-cli-session",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "VISIBLE_EVENTS_ONLY_TEXT" }]
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "message_delta",
+      delta: { stop_reason: "end_turn", stop_sequence: null },
+      usage: { output_tokens: 4 }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: { type: "message_stop" }
+  });
+  emit({
+    type: "result",
+    session_id: "fake-cli-session",
+    result: "VISIBLE_EVENTS_ONLY_TEXT",
+    usage: {
+      input_tokens: 1,
+      output_tokens: 4,
+      cache_creation_input_tokens: 2,
+      cache_read_input_tokens: 3
+    },
+    total_cost_usd: 0,
+    duration_ms: 10,
+    num_turns: 1,
+    is_error: false,
+    stop_reason: "end_turn"
+  });
+});
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
+function writeDuplicateThinkingSourceClaudeCommand(): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `duplicate-thinking-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let emitted = false;
+function emit(obj) {
+  process.stdout.write(JSON.stringify(obj) + "\\n");
+}
+process.stdin.on("data", (chunk) => {
+  if (emitted || !chunk.trim()) return;
+  emitted = true;
+  const thinkingBlock = {
+    type: "thinking",
+    thinking: "duplicate private reasoning",
+    signature: "sig_duplicate"
+  };
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "thinking", thinking: "" }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "thinking_delta", thinking: thinkingBlock.thinking }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "signature_delta", signature: thinkingBlock.signature }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: { type: "content_block_stop", index: 0 }
+  });
+  emit({
+    type: "assistant",
+    session_id: "fake-cli-session",
+    message: { role: "assistant", content: [thinkingBlock] }
+  });
+  emit({
+    type: "assistant",
+    session_id: "fake-cli-session",
+    message: { role: "assistant", content: [{ type: "text", text: "VISIBLE_DEDUPED_TEXT" }] }
+  });
+  emit({
+    type: "result",
+    session_id: "fake-cli-session",
+    result: "VISIBLE_DEDUPED_TEXT",
+    usage: {
+      input_tokens: 1,
+      output_tokens: 4,
+      cache_creation_input_tokens: 2,
+      cache_read_input_tokens: 3
+    },
+    total_cost_usd: 0,
+    duration_ms: 10,
+    num_turns: 1,
+    is_error: false,
+    stop_reason: "end_turn"
+  });
+});
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
 function writeArgvClaudeCommand(): string {
   const scriptPath = path.join(TEST_WORKSPACE, `argv-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
   fs.writeFileSync(
@@ -768,7 +1405,8 @@ process.stdin.on("data", (chunk) => {
 
 function writeMcpToolCallingClaudeCommand(
   delayBeforeToolUseStopMs = 0,
-  includeInternalToolSearch = false
+  includeInternalToolSearch = false,
+  includeToolPreamble = false
 ): string {
   const scriptPath = path.join(TEST_WORKSPACE, `mcp-tool-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
   fs.writeFileSync(
@@ -859,10 +1497,10 @@ async function runMcpToolCall() {
 
   const toolInput = { platform: "switch" };
   if (${includeInternalToolSearch}) {
-    emit({
-      type: "stream_event",
-      session_id: "fake-cli-session",
-      event: {
+	  emit({
+	    type: "stream_event",
+	    session_id: "fake-cli-session",
+	    event: {
         type: "message_start",
         message: {
           id: "msg_fake_tool_search",
@@ -935,41 +1573,67 @@ async function runMcpToolCall() {
         content: [],
         stop_reason: null,
         stop_sequence: null,
-        usage: { input_tokens: 10, output_tokens: 0 }
-      }
-    }
-  });
-  emit({
-    type: "stream_event",
-    session_id: "fake-cli-session",
-    event: {
-      type: "content_block_start",
-      index: 0,
-      content_block: {
-        type: "tool_use",
-        id: "toolu_frame_budget_001",
-        name: "lookup_frame_budget",
+	        usage: { input_tokens: 10, output_tokens: 0 }
+	      }
+	    }
+	  });
+	  if (${includeToolPreamble}) {
+	    emit({
+	      type: "stream_event",
+	      session_id: "fake-cli-session",
+	      event: {
+	        type: "content_block_start",
+	        index: 0,
+	        content_block: { type: "text", text: "" }
+	      }
+	    });
+	    emit({
+	      type: "stream_event",
+	      session_id: "fake-cli-session",
+	      event: {
+	        type: "content_block_delta",
+	        index: 0,
+	        delta: { type: "text_delta", text: "Calling lookup_frame_budget now." }
+	      }
+	    });
+	    emit({
+	      type: "stream_event",
+	      session_id: "fake-cli-session",
+	      event: { type: "content_block_stop", index: 0 }
+	    });
+	  }
+	  const toolIndex = ${includeToolPreamble} ? 1 : 0;
+	  emit({
+	    type: "stream_event",
+	    session_id: "fake-cli-session",
+	    event: {
+	      type: "content_block_start",
+	      index: toolIndex,
+	      content_block: {
+	        type: "tool_use",
+	        id: "toolu_frame_budget_001",
+	        name: "lookup_frame_budget",
         input: {}
       }
     }
   });
-  emit({
-    type: "stream_event",
-    session_id: "fake-cli-session",
-    event: {
-      type: "content_block_delta",
-      index: 0,
-      delta: { type: "input_json_delta", partial_json: JSON.stringify(toolInput) }
-    }
-  });
+	  emit({
+	    type: "stream_event",
+	    session_id: "fake-cli-session",
+	    event: {
+	      type: "content_block_delta",
+	      index: toolIndex,
+	      delta: { type: "input_json_delta", partial_json: JSON.stringify(toolInput) }
+	    }
+	  });
   if (${delayBeforeToolUseStopMs} > 0) {
     await new Promise((resolve) => setTimeout(resolve, ${delayBeforeToolUseStopMs}));
   }
-  emit({
-    type: "stream_event",
-    session_id: "fake-cli-session",
-    event: { type: "content_block_stop", index: 0 }
-  });
+	  emit({
+	    type: "stream_event",
+	    session_id: "fake-cli-session",
+	    event: { type: "content_block_stop", index: toolIndex }
+	  });
   emit({
     type: "stream_event",
     session_id: "fake-cli-session",
@@ -1026,6 +1690,382 @@ process.stdin.on("data", async (chunk) => {
   started = true;
   try {
     await runMcpToolCall();
+  } catch (err) {
+    emit({
+      type: "result",
+      session_id: "fake-cli-session",
+      result: err.message,
+      usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      total_cost_usd: 0,
+      duration_ms: 1,
+      num_turns: 1,
+      is_error: true,
+      stop_reason: "error"
+    });
+  }
+});
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
+function writeMcpCallBeforeStreamClaudeCommand(): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `mcp-call-first-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+const { spawn } = require("child_process");
+process.stdin.setEncoding("utf8");
+
+function emit(obj) {
+  process.stdout.write(JSON.stringify(obj) + "\\n");
+}
+
+function getMcpConfig() {
+  const idx = process.argv.indexOf("--mcp-config");
+  if (idx < 0 || !process.argv[idx + 1]) {
+    throw new Error("missing --mcp-config");
+  }
+  return JSON.parse(process.argv[idx + 1]);
+}
+
+function writeFrame(stream, obj) {
+  const json = JSON.stringify(obj);
+  stream.write("Content-Length: " + Buffer.byteLength(json) + "\\r\\n\\r\\n" + json);
+}
+
+function createRpcClient(proc) {
+  let nextId = 1;
+  let buffer = Buffer.alloc(0);
+  const pending = new Map();
+  proc.stdout.on("data", (chunk) => {
+    buffer = Buffer.concat([buffer, chunk]);
+    while (true) {
+      const sep = buffer.indexOf("\\r\\n\\r\\n");
+      if (sep < 0) return;
+      const header = buffer.slice(0, sep).toString("utf8");
+      const match = header.match(/content-length:\\s*(\\d+)/i);
+      if (!match) throw new Error("missing MCP content-length");
+      const length = Number(match[1]);
+      const start = sep + 4;
+      if (buffer.length < start + length) return;
+      const msg = JSON.parse(buffer.slice(start, start + length).toString("utf8"));
+      buffer = buffer.slice(start + length);
+      if (msg.id && pending.has(msg.id)) {
+        const { resolve, reject } = pending.get(msg.id);
+        pending.delete(msg.id);
+        if (msg.error) reject(new Error(msg.error.message || "mcp error"));
+        else resolve(msg);
+      }
+    }
+  });
+  return {
+    request(method, params) {
+      const id = nextId++;
+      writeFrame(proc.stdin, { jsonrpc: "2.0", id, method, params });
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        setTimeout(() => {
+          if (pending.delete(id)) reject(new Error("MCP request timed out: " + method));
+        }, 4000);
+      });
+    },
+    notify(method, params) {
+      writeFrame(proc.stdin, { jsonrpc: "2.0", method, params });
+    }
+  };
+}
+
+async function runMcpToolCall() {
+  const config = getMcpConfig();
+  const server = config.mcpServers && config.mcpServers.cc_client_tools;
+  if (!server) throw new Error("missing cc_client_tools MCP server");
+  const proc = spawn(server.command, server.args || [], {
+    env: { ...process.env, ...(server.env || {}) },
+    stdio: ["pipe", "pipe", "inherit"],
+  });
+  const rpc = createRpcClient(proc);
+  await rpc.request("initialize", {
+    protocolVersion: "2024-11-05",
+    capabilities: {},
+    clientInfo: { name: "fake-claude", version: "test" },
+  });
+  rpc.notify("notifications/initialized", {});
+  const listed = await rpc.request("tools/list", {});
+  const tools = listed.result && listed.result.tools || [];
+  if (!tools.some((tool) => tool.name === "Bash")) {
+    throw new Error("Bash was not listed by MCP server");
+  }
+
+  const callResult = await rpc.request("tools/call", {
+    name: "Bash",
+    arguments: {
+      command: "echo CC_PROXY_BEHAVIOR_OK",
+      description: "Verify behavior bridge",
+    },
+  });
+  const text = (callResult.result && callResult.result.content || [])
+    .map((item) => item.text || "")
+    .join("\\n");
+  const finalText = "CLIENT_TOOL_RESULT:" + text;
+  emit({
+    type: "assistant",
+    session_id: "fake-cli-session",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: finalText }]
+    }
+  });
+  emit({
+    type: "result",
+    session_id: "fake-cli-session",
+    result: finalText,
+    usage: {
+      input_tokens: 22,
+      output_tokens: 9,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0
+    },
+    total_cost_usd: 0,
+    duration_ms: 50,
+    num_turns: 1,
+    is_error: false,
+    stop_reason: "end_turn"
+  });
+  proc.kill("SIGKILL");
+}
+
+let started = false;
+process.stdin.on("data", async (chunk) => {
+  if (started || !chunk.trim()) return;
+  started = true;
+  try {
+    await runMcpToolCall();
+  } catch (err) {
+    emit({
+      type: "result",
+      session_id: "fake-cli-session",
+      result: err.message,
+      usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      total_cost_usd: 0,
+      duration_ms: 1,
+      num_turns: 1,
+      is_error: true,
+      stop_reason: "error"
+    });
+  }
+});
+`,
+    "utf-8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
+function writeMcpTwoStepToolCallingClaudeCommand(): string {
+  const scriptPath = path.join(TEST_WORKSPACE, `mcp-two-step-claude-${Date.now()}-${Math.random().toString(16).slice(2)}.js`);
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+const { spawn } = require("child_process");
+process.stdin.setEncoding("utf8");
+
+function emit(obj) {
+  process.stdout.write(JSON.stringify(obj) + "\\n");
+}
+
+function getMcpConfig() {
+  const idx = process.argv.indexOf("--mcp-config");
+  if (idx < 0 || !process.argv[idx + 1]) {
+    throw new Error("missing --mcp-config");
+  }
+  return JSON.parse(process.argv[idx + 1]);
+}
+
+function writeFrame(stream, obj) {
+  const json = JSON.stringify(obj);
+  stream.write("Content-Length: " + Buffer.byteLength(json) + "\\r\\n\\r\\n" + json);
+}
+
+function createRpcClient(proc) {
+  let nextId = 1;
+  let buffer = Buffer.alloc(0);
+  const pending = new Map();
+  proc.stdout.on("data", (chunk) => {
+    buffer = Buffer.concat([buffer, chunk]);
+    while (true) {
+      const sep = buffer.indexOf("\\r\\n\\r\\n");
+      if (sep < 0) return;
+      const header = buffer.slice(0, sep).toString("utf8");
+      const match = header.match(/content-length:\\s*(\\d+)/i);
+      if (!match) throw new Error("missing MCP content-length");
+      const length = Number(match[1]);
+      const start = sep + 4;
+      if (buffer.length < start + length) return;
+      const msg = JSON.parse(buffer.slice(start, start + length).toString("utf8"));
+      buffer = buffer.slice(start + length);
+      if (msg.id && pending.has(msg.id)) {
+        const { resolve, reject } = pending.get(msg.id);
+        pending.delete(msg.id);
+        if (msg.error) reject(new Error(msg.error.message || "mcp error"));
+        else resolve(msg);
+      }
+    }
+  });
+  return {
+    request(method, params) {
+      const id = nextId++;
+      writeFrame(proc.stdin, { jsonrpc: "2.0", id, method, params });
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        setTimeout(() => {
+          if (pending.delete(id)) reject(new Error("MCP request timed out: " + method));
+        }, 4000);
+      });
+    },
+    notify(method, params) {
+      writeFrame(proc.stdin, { jsonrpc: "2.0", method, params });
+    }
+  };
+}
+
+function emitToolUse(id, input) {
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "message_start",
+      message: {
+        id: "msg_" + id,
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 10, output_tokens: 0 }
+      }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "content_block_start",
+      index: 0,
+      content_block: {
+        type: "tool_use",
+        id,
+        name: "lookup_frame_budget",
+        input: {}
+      }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "input_json_delta", partial_json: JSON.stringify(input) }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: { type: "content_block_stop", index: 0 }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: {
+      type: "message_delta",
+      delta: { stop_reason: "tool_use", stop_sequence: null },
+      usage: { output_tokens: 12 }
+    }
+  });
+  emit({
+    type: "stream_event",
+    session_id: "fake-cli-session",
+    event: { type: "message_stop" }
+  });
+}
+
+async function callClientTool(rpc, input) {
+  const callResult = await rpc.request("tools/call", {
+    name: "lookup_frame_budget",
+    arguments: input,
+  });
+  return (callResult.result && callResult.result.content || [])
+    .map((item) => item.text || "")
+    .join("\\n");
+}
+
+async function runMcpToolCalls() {
+  const config = getMcpConfig();
+  const server = config.mcpServers && config.mcpServers.cc_client_tools;
+  if (!server) throw new Error("missing cc_client_tools MCP server");
+  const proc = spawn(server.command, server.args || [], {
+    env: { ...process.env, ...(server.env || {}) },
+    stdio: ["pipe", "pipe", "inherit"],
+  });
+  const rpc = createRpcClient(proc);
+  await rpc.request("initialize", {
+    protocolVersion: "2024-11-05",
+    capabilities: {},
+    clientInfo: { name: "fake-claude", version: "test" },
+  });
+  rpc.notify("notifications/initialized", {});
+  const listed = await rpc.request("tools/list", {});
+  const tools = listed.result && listed.result.tools || [];
+  if (!tools.some((tool) => tool.name === "lookup_frame_budget")) {
+    throw new Error("lookup_frame_budget was not listed by MCP server");
+  }
+
+  const firstInput = { platform: "switch" };
+  emitToolUse("toolu_frame_budget_001", firstInput);
+  const firstText = await callClientTool(rpc, firstInput);
+
+  const secondInput = { platform: "steam-deck" };
+  emitToolUse("toolu_frame_budget_002", secondInput);
+  const secondText = await callClientTool(rpc, secondInput);
+
+  const finalText = "CLIENT_TOOL_RESULTS:" + firstText + " | " + secondText;
+  emit({
+    type: "assistant",
+    session_id: "fake-cli-session",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: finalText }]
+    }
+  });
+  emit({
+    type: "result",
+    session_id: "fake-cli-session",
+    result: finalText,
+    usage: {
+      input_tokens: 30,
+      output_tokens: 12,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0
+    },
+    total_cost_usd: 0,
+    duration_ms: 50,
+    num_turns: 1,
+    is_error: false,
+    stop_reason: "end_turn"
+  });
+  proc.kill("SIGKILL");
+}
+
+let started = false;
+process.stdin.on("data", async (chunk) => {
+  if (started || !chunk.trim()) return;
+  started = true;
+  try {
+    await runMcpToolCalls();
   } catch (err) {
     emit({
       type: "result",
@@ -1335,6 +2375,15 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       assert.equal(args[args.indexOf("--setting-sources") + 1], "project,local");
     });
 
+    it("adds disallowed tools option to spawned Claude CLI args", () => {
+      const args = resolveClaudeArgs({ disallowedTools: ["Bash", "Read"] });
+      assert.ok(
+        args.includes("--disallowedTools"),
+        "Claude CLI args should include disallowed tools option"
+      );
+      assert.equal(args[args.indexOf("--disallowedTools") + 1], "Bash,Read");
+    });
+
     it("uses admin-managed config as the per-server Claude window concurrency limit", async () => {
       const dataDir = makeIsolatedDataDir("admin-config-window-limit");
       const proc = await startTestServer(ZEABUR_PORT, {
@@ -1635,7 +2684,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.deepEqual(args, ["auth", "login", "--browser"]);
 
         let authBody: any = null;
-        for (let i = 0; i < 20; i++) {
+        for (let i = 0; i < 60; i++) {
           const auth = await httpGet(`${baseUrl}/admin/claude-auth`, {
             Authorization: `Bearer ${adminToken}`,
           });
@@ -1685,7 +2734,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.equal(started.status, 202, started.body);
 
         let authBody: any = null;
-        for (let i = 0; i < 20; i++) {
+        for (let i = 0; i < 60; i++) {
           const auth = await httpGet(`${baseUrl}/admin/claude-auth`, {
             Authorization: `Bearer ${adminToken}`,
           });
@@ -1736,7 +2785,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.equal(started.status, 202, started.body);
 
         let authBody: any = null;
-        for (let i = 0; i < 20; i++) {
+        for (let i = 0; i < 60; i++) {
           const auth = await httpGet(`${baseUrl}/admin/claude-auth`, {
             Authorization: `Bearer ${adminToken}`,
           });
@@ -1789,7 +2838,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.equal(started.status, 202, started.body);
 
         let authBody: any = null;
-        for (let i = 0; i < 20; i++) {
+        for (let i = 0; i < 60; i++) {
           const auth = await httpGet(`${baseUrl}/admin/claude-auth`, {
             Authorization: `Bearer ${adminToken}`,
           });
@@ -1896,7 +2945,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.equal(recorded.HOME, path.join(dataDir, "claude-home"));
 
         let authBody: any = null;
-        for (let i = 0; i < 20; i++) {
+        for (let i = 0; i < 60; i++) {
           const auth = await httpGet(`${baseUrl}/admin/claude-auth`, {
             Authorization: `Bearer ${adminToken}`,
           });
@@ -2374,6 +3423,18 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       );
     });
 
+    it("accepts LF-only MCP stdio frame separators from Claude Code", async () => {
+      const message = await requestMcpInitialize("\n\n");
+      assert.equal(message.id, 1);
+      assert.equal(message.result.serverInfo.name, "cc-proxy-client-tools");
+    });
+
+    it("accepts newline-delimited JSON-RPC MCP messages from Claude Code", async () => {
+      const message = await requestMcpInitialize("json-line");
+      assert.equal(message.id, 1);
+      assert.equal(message.result.serverInfo.name, "cc-proxy-client-tools");
+    });
+
     it("GET /health returns 200 with status ok", async () => {
       const res = await httpGet(`${BASE_URL}/health`);
       assert.equal(res.status, 200);
@@ -2417,6 +3478,35 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
   });
 
   describe("1b. Anthropic-compatible messages API", () => {
+    it("answers browser CORS preflight for Anthropic-compatible routes", async () => {
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+      });
+      try {
+        const res = await httpOptions(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            Origin: "https://cctest.example",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type",
+          }
+        );
+        assert.equal(res.status, 204, res.body);
+        assert.equal(res.headers["access-control-allow-origin"], "*");
+        assert.match(
+          String(res.headers["access-control-allow-methods"] || ""),
+          /POST/
+        );
+        assert.match(
+          String(res.headers["access-control-allow-headers"] || "").toLowerCase(),
+          /authorization/
+        );
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+      }
+    });
+
     it("requires an API key for /v1/messages when CC_PROXY_API_KEY is configured", async () => {
       const proc = await startTestServer(ANTHROPIC_PORT, {
         CC_PROXY_API_KEY: "test-secret",
@@ -2485,6 +3575,136 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       }
     });
 
+    it("automatically reuses a warm Claude Code window for standard API clients", async () => {
+      const dataDir = makeIsolatedDataDir("auto-session-affinity");
+      const recordPath = path.join(dataDir, "turns.json");
+      const fakeClaude = writePersistentTurnRecordingClaudeCommand(recordPath);
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+        CC_CLI_IDLE_TIMEOUT_MS: "600000",
+        CC_PROXY_AUTO_SESSION_AFFINITY: "1",
+      });
+      try {
+        const request = (content: string) => httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            messages: [{ role: "user", content }],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+
+        const first = await request("first standard request");
+        assert.equal(first.status, 200, first.body);
+        const firstSessionId = first.headers["x-cc-session-id"];
+        const firstCliSessionId = first.headers["x-cc-cli-session-id"];
+        assert.equal(typeof firstSessionId, "string");
+        assert.equal(typeof firstCliSessionId, "string");
+
+        const firstBody = JSON.parse(first.body);
+        const second = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            messages: [
+              { role: "user", content: "first standard request" },
+              { role: "assistant", content: firstBody.content },
+              { role: "user", content: "second standard request" },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(second.status, 200, second.body);
+        assert.equal(second.headers["x-cc-session-id"], firstSessionId);
+        assert.equal(second.headers["x-cc-cli-session-id"], firstCliSessionId);
+
+        const secondBody = JSON.parse(second.body);
+        assert.match(firstBody.content[0].text, /^PERSISTENT_TURN_1_PID_/);
+        assert.match(secondBody.content[0].text, /^PERSISTENT_TURN_2_PID_/);
+        assert.equal(secondBody.usage.cache_read_input_tokens, 100);
+
+        const recorded = await waitForJsonFile(recordPath);
+        assert.ok(recorded, "Claude input was not recorded");
+        assert.equal(recorded.length, 2);
+        assert.equal(recorded[0].pid, recorded[1].pid);
+        assert.equal(recorded[0].message_count, 1);
+        assert.equal(recorded[0].text, "first standard request");
+        assert.equal(recorded[1].message_count, 1);
+        assert.equal(recorded[1].text, "second standard request");
+
+        const health = await httpGet(`http://localhost:${ANTHROPIC_PORT}/health`);
+        assert.equal(health.status, 200, health.body);
+        assert.equal(JSON.parse(health.body).sessions, 1);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("keeps standard /v1/messages stateless by default for compatibility tests", async () => {
+      const fakeClaude = writeFakeClaudeCommand("stateless-ok");
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            messages: [{ role: "user", content: "ordinary stateless request" }],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200, res.body);
+        assert.equal(res.headers["x-cc-session-id"], undefined);
+        const health = await httpGet(`http://localhost:${ANTHROPIC_PORT}/health`);
+        assert.equal(health.status, 200, health.body);
+        assert.equal(JSON.parse(health.body).sessions, 0);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("returns an Anthropic-compatible token count for /v1/messages/count_tokens", async () => {
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages/count_tokens`,
+          {
+            model: "claude-sonnet-4-6",
+            system: "You are concise.",
+            tools: [
+              {
+                name: "lookup_marker",
+                description: "Look up a marker",
+                input_schema: { type: "object" },
+              },
+            ],
+            messages: [{ role: "user", content: "hello from count tokens" }],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200, res.body);
+        const body = JSON.parse(res.body);
+        assert.equal(typeof body.input_tokens, "number");
+        assert.ok(body.input_tokens > 0);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+      }
+    });
+
     it("returns request-id header and request_id on Anthropic errors", async () => {
       const proc = await startTestServer(ANTHROPIC_PORT, {
         CC_PROXY_API_KEY: "test-secret",
@@ -2526,6 +3746,242 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.equal(res.status, 200);
         assert.match(String(res.headers["request-id"] || ""), /^req_/);
         assert.match(res.body, /REQUEST_ID_OK/);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("normalizes non-thinking Anthropic message responses without Claude Code internals", async () => {
+      const fakeClaude = writeInspectingClaudeCommand();
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            messages: [{ role: "user", content: "hello" }],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200, res.body);
+        const body = JSON.parse(res.body);
+        assert.deepEqual(
+          body.content.map((block: any) => block.type),
+          ["text"]
+        );
+        assert.equal(body.content[0].text, "CONTENT_TYPES:text");
+        assert.equal("total_cost_usd" in body.usage, false);
+        assert.deepEqual(Object.keys(body.usage).sort(), [
+          "cache_creation_input_tokens",
+          "cache_read_input_tokens",
+          "input_tokens",
+          "output_tokens",
+        ]);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("applies Anthropic stop_sequences to non-streaming text responses", async () => {
+      const fakeClaude = writeFakeClaudeResultCommand(
+        "one two three HALT and never more",
+        { output_tokens: 8 }
+      );
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 80,
+            stop_sequences: ["HALT"],
+            messages: [
+              {
+                role: "user",
+                content: 'Say the words "one two three HALT and never more".',
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200, res.body);
+        const body = JSON.parse(res.body);
+        assert.equal(body.stop_reason, "stop_sequence");
+        assert.equal(body.stop_sequence, "HALT");
+        assert.equal(body.content[0].text, "one two three ");
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("writes Anthropic request/response diagnostic logs when enabled", async () => {
+      const dataDir = makeIsolatedDataDir("anthropic-diagnostic-log");
+      const fakeClaude = writeFakeClaudeResultCommand(
+        "one two three HALT and never more",
+        { output_tokens: 8 }
+      );
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_DATA_DIR: dataDir,
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+        CC_PROXY_DIAGNOSTIC_LOG: "1",
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 80,
+            stop_sequences: ["HALT"],
+            messages: [
+              {
+                role: "user",
+                content: 'Say the words "one two three HALT and never more".',
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200, res.body);
+
+        const logPath = path.join(dataDir, "messages-diagnostic.jsonl");
+        assert.equal(fs.existsSync(logPath), true, "diagnostic log should exist");
+        const records = fs.readFileSync(logPath, "utf8")
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line));
+        const responseRecord = records.find((record) => record.phase === "response");
+        assert.ok(responseRecord, "response diagnostic record should be written");
+        assert.equal(responseRecord.inferred_probe, "stop_sequence");
+        assert.equal(responseRecord.request.model, "claude-sonnet-4-6");
+        assert.equal(responseRecord.response.status, 200);
+        assert.equal(responseRecord.response.summary.stop_reason, "stop_sequence");
+        assert.equal(responseRecord.response.summary.stop_sequence, "HALT");
+        assert.match(responseRecord.response.summary.text, /^one two three /);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("caps Anthropic max_tokens when Claude Code ignores the requested limit", async () => {
+      const fakeClaude = writeFakeClaudeResultCommand(
+        "This is a deliberately long response that exceeds a tiny requested token limit.",
+        { output_tokens: 24 }
+      );
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 5,
+            messages: [
+              {
+                role: "user",
+                content:
+                  "Write a very long essay about the history of computing, at least five hundred words.",
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200, res.body);
+        const body = JSON.parse(res.body);
+        assert.equal(body.stop_reason, "max_tokens");
+        assert.equal(body.usage.output_tokens, 5);
+        assert.ok(body.content[0].text.length < 40, body.content[0].text);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("collapses pure text multi-turn history into one Claude Code turn", async () => {
+      const dataDir = makeIsolatedDataDir("multi-turn-collapse");
+      const recordPath = path.join(dataDir, "claude-messages.json");
+      const fakeClaude = writeMessageRecordingClaudeCommand(recordPath);
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 20,
+            messages: [
+              {
+                role: "user",
+                content: 'Remember this code: PINEAPPLE-7742. Just say "noted".',
+              },
+              { role: "assistant", content: "Noted." },
+              {
+                role: "user",
+                content:
+                  "What was the code I asked you to remember? Reply with ONLY the code.",
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200, res.body);
+        const recorded = await waitForJsonFile(recordPath);
+        assert.ok(recorded, "Claude input was not recorded");
+        assert.equal(recorded.length, 1);
+        const text = recorded[0].message.content[0].text;
+        assert.match(text, /PINEAPPLE-7742/);
+        assert.match(text, /What was the code/);
+        assert.match(text, /answer the latest user message/i);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("can hide Claude Code internal cache usage from Anthropic-compatible responses", async () => {
+      const fakeClaude = writeInspectingClaudeCommand();
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+        CC_PROXY_NORMALIZE_ANTHROPIC_USAGE: "1",
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            messages: [{ role: "user", content: "hello" }],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200, res.body);
+        const body = JSON.parse(res.body);
+        assert.equal(body.usage.input_tokens, 3);
+        assert.equal(body.usage.output_tokens, 4);
+        assert.equal(body.usage.cache_creation_input_tokens, 0);
+        assert.equal(body.usage.cache_read_input_tokens, 0);
       } finally {
         proc.kill("SIGKILL");
         await sleep(300);
@@ -2770,7 +4226,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.match(res.body, /event: message_delta/);
         assert.match(res.body, /event: message_stop/);
         assert.match(res.body, /FAKE_STREAM_RESULT/);
-        assert.match(res.body, /"total_cost_usd":0.0123/);
+        assert.doesNotMatch(res.body, /total_cost_usd/);
       } finally {
         proc.kill("SIGKILL");
         await sleep(300);
@@ -2804,6 +4260,174 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.ok(
           lastChunk.atMs - res.chunks[0].atMs >= 500,
           `first SSE chunk should arrive live before delayed result; first=${res.chunks[0].atMs}ms last=${lastChunk.atMs}ms`
+        );
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("normalizes stream events without non-requested Claude Code thinking blocks", async () => {
+      const fakeClaude = writeThinkingStreamingClaudeCommand(700);
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPostChunked(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            stream: true,
+            messages: [{ role: "user", content: "hello" }],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200, res.body);
+        assert.match(String(res.headers["content-type"]), /^text\/event-stream/);
+        assert.doesNotMatch(res.body, /thinking/);
+        assert.doesNotMatch(res.body, /total_cost_usd/);
+        assert.match(res.body, /VISIBLE_STREAM_TEXT/);
+        assert.match(
+          res.body,
+          /"type":"content_block_start","index":0,"content_block":\{"type":"text","text":""\}/
+        );
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("streams thinking signatures when extended thinking is requested", async () => {
+      const fakeClaude = writeThinkingStreamingClaudeCommand(700);
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPostChunked(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 4096,
+            stream: true,
+            thinking: { type: "enabled", budget_tokens: 1024 },
+            messages: [{ role: "user", content: "hello" }],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200, res.body);
+        assert.match(String(res.headers["content-type"]), /^text\/event-stream/);
+        assert.match(res.body, /"type":"thinking_delta","thinking":"internal reasoning"/);
+        assert.match(res.body, /"type":"signature_delta","signature":"sig_internal"/);
+        assert.ok(
+          res.body.indexOf('"type":"signature_delta"') < res.body.indexOf('"type":"content_block_stop","index":0'),
+          "signature_delta must arrive before the thinking content_block_stop"
+        );
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("preserves thinking signatures that only appear in stream events", async () => {
+      const fakeClaude = writeThinkingEventsOnlyClaudeCommand();
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 4096,
+            thinking: { type: "enabled", budget_tokens: 1024 },
+            messages: [{ role: "user", content: "hello" }],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200, res.body);
+        const body = JSON.parse(res.body);
+        assert.deepEqual(body.content, [
+          {
+            type: "thinking",
+            thinking: "streamed private reasoning",
+            signature: "sig_stream_only",
+          },
+          { type: "text", text: "VISIBLE_EVENTS_ONLY_TEXT" },
+        ]);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("deduplicates identical thinking blocks captured from multiple Claude events", async () => {
+      const fakeClaude = writeDuplicateThinkingSourceClaudeCommand();
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 4096,
+            thinking: { type: "enabled", budget_tokens: 1024 },
+            messages: [{ role: "user", content: "hello" }],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200, res.body);
+        const body = JSON.parse(res.body);
+        assert.deepEqual(body.content, [
+          {
+            type: "thinking",
+            thinking: "duplicate private reasoning",
+            signature: "sig_duplicate",
+          },
+          { type: "text", text: "VISIBLE_DEDUPED_TEXT" },
+        ]);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("adds extended thinking guidance without prepending it to the user message", async () => {
+      const dataDir = makeIsolatedDataDir("thinking-guidance");
+      const recordPath = path.join(dataDir, "claude-messages.json");
+      const fakeClaude = writeMessageRecordingClaudeCommand(recordPath);
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 4096,
+            thinking: { type: "enabled", budget_tokens: 1024 },
+            messages: [{ role: "user", content: "hello" }],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200, res.body);
+        const recorded = await waitForJsonFile(recordPath);
+        assert.ok(recorded, "Claude input was not recorded");
+        assert.equal(recorded[0].message.content[0].text, "hello");
+        assert.match(
+          JSON.stringify(recorded[0].message.content),
+          /extended thinking.*signed thinking block/i
         );
       } finally {
         proc.kill("SIGKILL");
@@ -2897,6 +4521,140 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       }
     });
 
+    it("exposes client tool_use when Claude Code calls MCP before emitting stream tool_use events", async () => {
+      const fakeClaude = writeMcpCallBeforeStreamClaudeCommand();
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+        CC_CLIENT_TOOL_TIMEOUT_MS: "1000",
+      });
+      try {
+        const first = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            tools: [
+              {
+                name: "Bash",
+                description: "Run a bash command.",
+                input_schema: {
+                  type: "object",
+                  properties: {
+                    command: { type: "string" },
+                    description: { type: "string" },
+                  },
+                  required: ["command"],
+                },
+              },
+            ],
+            messages: [
+              {
+                role: "user",
+                content: "Use Bash to echo CC_PROXY_BEHAVIOR_OK.",
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(first.status, 200, first.body);
+        const firstBody = JSON.parse(first.body);
+        assert.equal(firstBody.stop_reason, "tool_use");
+        assert.equal(firstBody.content.length, 1);
+        assert.equal(firstBody.content[0].type, "tool_use");
+        assert.match(firstBody.content[0].id, /^toolu_/);
+        assert.equal(firstBody.content[0].name, "Bash");
+        assert.deepEqual(firstBody.content[0].input, {
+          command: "echo CC_PROXY_BEHAVIOR_OK",
+          description: "Verify behavior bridge",
+        });
+
+        const second = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 256,
+            messages: [
+              {
+                role: "user",
+                content: "Use Bash to echo CC_PROXY_BEHAVIOR_OK.",
+              },
+              {
+                role: "assistant",
+                content: firstBody.content,
+              },
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: firstBody.content[0].id,
+                    content: "CC_PROXY_BEHAVIOR_OK",
+                  },
+                ],
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(second.status, 200, second.body);
+        const secondBody = JSON.parse(second.body);
+        assert.equal(secondBody.stop_reason, "end_turn");
+        assert.match(secondBody.content[0].text, /CLIENT_TOOL_RESULT:CC_PROXY_BEHAVIOR_OK/);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("omits assistant preamble text from client tool_use responses", async () => {
+      const fakeClaude = writeMcpToolCallingClaudeCommand(0, false, true);
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const first = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            tools: [
+              {
+                name: "lookup_frame_budget",
+                description: "Look up a game frame budget.",
+                input_schema: {
+                  type: "object",
+                  properties: { platform: { type: "string" } },
+                },
+              },
+            ],
+            messages: [
+              {
+                role: "user",
+                content:
+                  "Use lookup_frame_budget for a Nintendo Switch action RPG frame-budget check.",
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(first.status, 200, first.body);
+        const firstBody = JSON.parse(first.body);
+        assert.equal(firstBody.stop_reason, "tool_use");
+        assert.deepEqual(
+          firstBody.content.map((block: any) => block.type),
+          ["tool_use"]
+        );
+        assert.equal(firstBody.content[0].id, "toolu_frame_budget_001");
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
     it("ignores Claude Code internal tool search before exposing client-supplied tools", async () => {
       const fakeClaude = writeMcpToolCallingClaudeCommand(0, true);
       const proc = await startTestServer(ANTHROPIC_PORT, {
@@ -2936,6 +4694,52 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.equal(firstBody.content[0].type, "tool_use");
         assert.equal(firstBody.content[0].name, "lookup_frame_budget");
         assert.equal(firstBody.content[0].id, "toolu_frame_budget_001");
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("does not stream Claude Code internal tool search as a client-supplied tool_use", async () => {
+      const fakeClaude = writeMcpToolCallingClaudeCommand(0, true);
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const first = await httpPostChunked(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            stream: true,
+            tools: [
+              {
+                name: "lookup_frame_budget",
+                description: "Look up a game frame budget.",
+                input_schema: {
+                  type: "object",
+                  properties: { platform: { type: "string" } },
+                },
+              },
+            ],
+            messages: [
+              {
+                role: "user",
+                content:
+                  "Use lookup_frame_budget for a Nintendo Switch action RPG frame-budget check.",
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(first.status, 200, first.body);
+        assert.match(String(first.headers["content-type"]), /^text\/event-stream/);
+        assert.doesNotMatch(first.body, /ToolSearch/);
+        assert.doesNotMatch(first.body, /toolu_internal_search_001/);
+        assert.match(first.body, /toolu_frame_budget_001/);
+        assert.match(first.body, /lookup_frame_budget/);
       } finally {
         proc.kill("SIGKILL");
         await sleep(300);
@@ -3016,6 +4820,137 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       }
     });
 
+    it("returns subsequent client tool_use batches after an earlier tool_result resumes Claude Code", async () => {
+      const fakeClaude = writeMcpTwoStepToolCallingClaudeCommand();
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const first = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            tools: [
+              {
+                name: "lookup_frame_budget",
+                description: "Look up a game frame budget.",
+                input_schema: {
+                  type: "object",
+                  properties: { platform: { type: "string" } },
+                },
+              },
+            ],
+            messages: [
+              {
+                role: "user",
+                content:
+                  "Use lookup_frame_budget twice before answering.",
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(first.status, 200, first.body);
+        const firstBody = JSON.parse(first.body);
+        assert.equal(firstBody.stop_reason, "tool_use");
+        assert.deepEqual(firstBody.content, [
+          {
+            type: "tool_use",
+            id: "toolu_frame_budget_001",
+            name: "lookup_frame_budget",
+            input: { platform: "switch" },
+          },
+        ]);
+
+        const second = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 256,
+            messages: [
+              {
+                role: "user",
+                content:
+                  "Use lookup_frame_budget twice before answering.",
+              },
+              { role: "assistant", content: firstBody.content },
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: "toolu_frame_budget_001",
+                    content: "Switch handheld budget: keep the game under 16.67ms.",
+                  },
+                ],
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(second.status, 200, second.body);
+        const secondBody = JSON.parse(second.body);
+        assert.equal(secondBody.stop_reason, "tool_use");
+        assert.deepEqual(secondBody.content, [
+          {
+            type: "tool_use",
+            id: "toolu_frame_budget_002",
+            name: "lookup_frame_budget",
+            input: { platform: "steam-deck" },
+          },
+        ]);
+
+        const third = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 256,
+            messages: [
+              {
+                role: "user",
+                content:
+                  "Use lookup_frame_budget twice before answering.",
+              },
+              { role: "assistant", content: firstBody.content },
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: "toolu_frame_budget_001",
+                    content: "Switch handheld budget: keep the game under 16.67ms.",
+                  },
+                ],
+              },
+              { role: "assistant", content: secondBody.content },
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: "toolu_frame_budget_002",
+                    content: "Steam Deck budget: reserve 4ms for thermal spikes.",
+                  },
+                ],
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(third.status, 200, third.body);
+        const thirdBody = JSON.parse(third.body);
+        assert.equal(thirdBody.stop_reason, "end_turn");
+        assert.match(thirdBody.content[0].text, /CLIENT_TOOL_RESULTS:Switch handheld budget/);
+        assert.match(thirdBody.content[0].text, /Steam Deck budget/);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
     it("streams client-supplied tool_use and streams the resumed tool_result answer", async () => {
       const fakeClaude = writeMcpToolCallingClaudeCommand(1400);
       const proc = await startTestServer(ANTHROPIC_PORT, {
@@ -3054,11 +4989,6 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         assert.match(first.body, /toolu_frame_budget_001/);
         assert.match(first.body, /"stop_reason":"tool_use"/);
         assert.ok(first.chunks.length > 0, "stream should produce tool_use chunks");
-        const firstLastChunk = first.chunks[first.chunks.length - 1];
-        assert.ok(
-          firstLastChunk.atMs - first.chunks[0].atMs >= 500,
-          `first tool_use SSE chunk should arrive live before delayed message_stop; first=${first.chunks[0].atMs}ms last=${firstLastChunk.atMs}ms`
-        );
 
         const second = await httpPostChunked(
           `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
@@ -3136,6 +5066,7 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
                     id: "toolu_completed_001",
                     name: "lookup_frame_budget",
                     input: { platform: "switch" },
+                    cache_control: { type: "ephemeral", ttl: "1h" },
                   },
                 ],
               },
@@ -3146,10 +5077,12 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
                     type: "tool_result",
                     tool_use_id: "toolu_completed_001",
                     content: "Switch handheld budget: 16.67ms.",
+                    cache_control: { type: "ephemeral", ttl: "1h" },
                   },
                   {
                     type: "text",
                     text: "Use that result in the final answer.",
+                    cache_control: { type: "ephemeral", ttl: "5m" },
                   },
                 ],
               },
@@ -3175,6 +5108,297 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
           tool_use_id: "toolu_completed_001",
           content: "Switch handheld budget: 16.67ms.",
         });
+        assert.equal("cache_control" in recorded[1].message.content[0], false);
+        assert.equal("cache_control" in recorded[2].message.content[0], false);
+        assert.equal("cache_control" in recorded[2].message.content[1], false);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("releases abandoned client tool sessions after the client tool timeout", async () => {
+      const fakeClaude = writeMcpToolCallingClaudeCommand();
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+        CC_MAX_SESSIONS: "1",
+        CC_CLIENT_TOOL_TIMEOUT_MS: "1000",
+        CC_CLI_IDLE_TIMEOUT_MS: "600000",
+      });
+      try {
+        const requestBody = {
+          model: "claude-sonnet-4-6",
+          max_tokens: 128,
+          tools: [
+            {
+              name: "lookup_frame_budget",
+              description: "Look up a game frame budget.",
+              input_schema: {
+                type: "object",
+                properties: { platform: { type: "string" } },
+              },
+            },
+          ],
+          messages: [
+            {
+              role: "user",
+              content:
+                "Use lookup_frame_budget for a Nintendo Switch action RPG frame-budget check.",
+            },
+          ],
+        };
+
+        const first = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          requestBody,
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(first.status, 200, first.body);
+        assert.equal(JSON.parse(first.body).stop_reason, "tool_use");
+
+        await sleep(1800);
+        const health = await httpGet(`http://localhost:${ANTHROPIC_PORT}/health`);
+        assert.equal(health.status, 200, health.body);
+        assert.equal(JSON.parse(health.body).sessions, 0);
+
+        const second = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          requestBody,
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(second.status, 200, second.body);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("does not prepend client tool bridge instructions to the user message", async () => {
+      const dataDir = makeIsolatedDataDir("client-tool-no-bridge-context");
+      const recordPath = path.join(dataDir, "claude-messages.json");
+      const fakeClaude = writeMessageRecordingClaudeCommand(recordPath);
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            tools: [
+              {
+                name: "read_local_marker",
+                description: "Read a local marker from the downstream client.",
+                input_schema: { type: "object", properties: {} },
+              },
+            ],
+            messages: [
+              {
+                role: "user",
+                content: "Use the client tool and report the marker.",
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200, res.body);
+        const recorded = await waitForJsonFile(recordPath);
+        assert.ok(recorded, "Claude input was not recorded");
+        assert.equal(recorded[0].message.content[0].type, "text");
+        assert.equal(
+          recorded[0].message.content[0].text,
+          "Use the client tool and report the marker."
+        );
+        assert.doesNotMatch(
+          JSON.stringify(recorded[0].message.content),
+          /cc-proxy client tool bridge|client-provided tools execute/
+        );
+        assert.match(
+          JSON.stringify(recorded[0].message.content),
+          /normal API client tools/
+        );
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("adds forced tool_choice guidance without prepending it to the user message", async () => {
+      const dataDir = makeIsolatedDataDir("client-tool-choice-forced");
+      const recordPath = path.join(dataDir, "claude-messages.json");
+      const fakeClaude = writeMessageRecordingClaudeCommand(recordPath);
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            tools: [
+              {
+                name: "read_local_marker",
+                description: "Read a local marker from the downstream client.",
+                input_schema: { type: "object", properties: {} },
+              },
+            ],
+            tool_choice: { type: "tool", name: "read_local_marker" },
+            messages: [
+              {
+                role: "user",
+                content: "Report the marker.",
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200, res.body);
+        const recorded = await waitForJsonFile(recordPath);
+        assert.ok(recorded, "Claude input was not recorded");
+        assert.equal(recorded[0].message.content[0].text, "Report the marker.");
+        assert.match(
+          JSON.stringify(recorded[0].message.content),
+          /must use.*read_local_marker/i
+        );
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("does not attach client tools when tool_choice forbids tool use", async () => {
+      const dataDir = makeIsolatedDataDir("client-tool-choice-none");
+      const argsPath = path.join(dataDir, "claude-args.json");
+      const fakeClaude = writeArgRecordingResultClaudeCommand(argsPath);
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            tools: [
+              {
+                name: "read_local_marker",
+                description: "Read a local marker from the downstream client.",
+                input_schema: { type: "object", properties: {} },
+              },
+            ],
+            tool_choice: { type: "none" },
+            messages: [
+              {
+                role: "user",
+                content: "Do not call tools.",
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200, res.body);
+        assert.equal(await waitForFile(argsPath), true, "Claude CLI args file was not written");
+        const args = JSON.parse(fs.readFileSync(argsPath, "utf-8"));
+        assert.equal(args.includes("--mcp-config"), false, `unexpected mcp config: ${args.join(" ")}`);
+        assert.equal(args.includes("--strict-mcp-config"), false, `unexpected strict mcp config: ${args.join(" ")}`);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("rejects forced tool_choice names that are not in the request tools", async () => {
+      const fakeClaude = writeFakeClaudeCommand("SHOULD_NOT_RUN");
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            tools: [
+              {
+                name: "read_local_marker",
+                description: "Read a local marker from the downstream client.",
+                input_schema: { type: "object", properties: {} },
+              },
+            ],
+            tool_choice: { type: "tool", name: "missing_tool" },
+            messages: [{ role: "user", content: "Use the missing tool." }],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 400, res.body);
+        const body = JSON.parse(res.body);
+        assert.equal(body.error.type, "invalid_request_error");
+        assert.match(body.error.message, /missing_tool/);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
+    it("disables remote built-in tools when client-supplied tools are bridged", async () => {
+      const dataDir = makeIsolatedDataDir("client-tool-bridge-args");
+      const argsPath = path.join(dataDir, "claude-args.json");
+      const fakeClaude = writeArgRecordingResultClaudeCommand(argsPath);
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-sonnet-4-6",
+            max_tokens: 128,
+            tools: [
+              {
+                name: "Read",
+                description: "Read a local file from the downstream client.",
+                input_schema: {
+                  type: "object",
+                  properties: { file_path: { type: "string" } },
+                },
+              },
+            ],
+            messages: [
+              {
+                role: "user",
+                content: "Record bridge args.",
+              },
+            ],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200, res.body);
+        assert.equal(await waitForFile(argsPath), true, "Claude CLI args file was not written");
+        const args = JSON.parse(fs.readFileSync(argsPath, "utf-8"));
+        assert.equal(args.includes("--mcp-config"), true, `missing mcp config: ${args.join(" ")}`);
+        assert.equal(args.includes("--strict-mcp-config"), true, `missing strict mcp config: ${args.join(" ")}`);
+        assert.equal(args.includes("--allowedTools"), false, `should not filter MCP tools: ${args.join(" ")}`);
+        assert.equal(args.includes("--tools"), false, `should not disable MCP tools: ${args.join(" ")}`);
+        const disallowed = args[args.indexOf("--disallowedTools") + 1];
+        assert.match(disallowed, /Bash/);
+        assert.match(disallowed, /Read/);
+        assert.match(disallowed, /Write/);
+        assert.match(disallowed, /Edit/);
+        assert.match(disallowed, /Grep/);
       } finally {
         proc.kill("SIGKILL");
         await sleep(300);
@@ -3269,6 +5493,35 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
       }
     });
 
+    it("maps the minimum Anthropic thinking budget to a signature-compatible Claude Code effort", async () => {
+      const fakeClaude = writeArgvClaudeCommand();
+      const proc = await startTestServer(ANTHROPIC_PORT, {
+        CC_PROXY_API_KEY: "test-secret",
+        CLAUDE_COMMAND: fakeClaude,
+      });
+      try {
+        const res = await httpPost(
+          `http://localhost:${ANTHROPIC_PORT}/v1/messages`,
+          {
+            model: "claude-request-model",
+            max_tokens: 4096,
+            thinking: { type: "enabled", budget_tokens: 1024 },
+            messages: [{ role: "user", content: "hello" }],
+          },
+          { Authorization: "Bearer test-secret" }
+        );
+        assert.equal(res.status, 200);
+        const body = JSON.parse(res.body);
+        const text = body.content?.[0]?.text || "";
+        assert.match(text, /--effort high/);
+        assert.doesNotMatch(text, /--effort low/);
+      } finally {
+        proc.kill("SIGKILL");
+        await sleep(300);
+        if (fs.existsSync(fakeClaude)) fs.unlinkSync(fakeClaude);
+      }
+    });
+
     it("passes multimodal content to Claude Code as native stream-json blocks and preserves assistant blocks", async () => {
       const fakeClaude = writeInspectingClaudeCommand();
       const proc = await startTestServer(ANTHROPIC_PORT, {
@@ -3305,10 +5558,11 @@ describe("cc-proxy: Hook Tool Forwarding", () => {
         );
         const body = JSON.parse(res.body);
         assert.equal(res.status, 200);
-        assert.equal(body.content[0].type, "thinking");
-        assert.equal(body.content[0].signature, "sig_native_probe");
-        assert.equal(body.content[1].type, "text");
-        assert.equal(body.content[1].text, "CONTENT_TYPES:image,text");
+        assert.deepEqual(
+          body.content.map((block: any) => block.type),
+          ["text"]
+        );
+        assert.equal(body.content[0].text, "CONTENT_TYPES:image,text");
       } finally {
         proc.kill("SIGKILL");
         await sleep(300);

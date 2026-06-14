@@ -50,12 +50,23 @@ interface ActiveBlock {
   raw?: any;
 }
 
+type SyntheticToolUseListener = (block: ToolUseBlock) => void;
+
+export interface ClientToolUseBatch {
+  messageId: string;
+  content: ClaudeContentBlock[];
+  toolUseIds: Set<string>;
+  usage: TurnUsage;
+}
+
 export class ClientToolBridge {
   readonly id = randomUUID();
   readonly token = randomUUID();
   private calls: ClientToolCall[] = [];
   private toolUses: ToolUseBlock[] = [];
   private queuedResults = new Map<string, ClientToolResultBlock>();
+  private syntheticToolUseIds = new Set<string>();
+  private syntheticToolUseListeners: SyntheticToolUseListener[] = [];
 
   constructor(
     readonly tools: ClientToolSpec[],
@@ -92,13 +103,16 @@ export class ClientToolBridge {
       call.timer.unref?.();
       this.calls.push(call);
       this.pairCalls();
+      this.promoteUnpairedCallToSyntheticToolUse(call);
     });
   }
 
-  registerToolUse(block: ToolUseBlock): void {
-    if (this.toolUses.some((item) => item.id === block.id)) return;
+  registerToolUse(block: ToolUseBlock): boolean {
+    if (this.toolUses.some((item) => item.id === block.id)) return false;
+    if (this.matchesPromotedSyntheticToolUse(block)) return false;
     this.toolUses.push(block);
     this.pairCalls();
+    return true;
   }
 
   deliverToolResult(result: ClientToolResultBlock): boolean {
@@ -114,6 +128,13 @@ export class ClientToolBridge {
     return true;
   }
 
+  onSyntheticToolUse(listener: SyntheticToolUseListener): () => void {
+    this.syntheticToolUseListeners.push(listener);
+    return () => {
+      this.syntheticToolUseListeners = this.syntheticToolUseListeners.filter((item) => item !== listener);
+    };
+  }
+
   dispose(): void {
     for (const call of this.calls) {
       clearTimeout(call.timer);
@@ -121,6 +142,7 @@ export class ClientToolBridge {
     }
     this.calls = [];
     this.queuedResults.clear();
+    this.syntheticToolUseListeners = [];
   }
 
   private pairCalls(): void {
@@ -149,6 +171,40 @@ export class ClientToolBridge {
     }
   }
 
+  private promoteUnpairedCallToSyntheticToolUse(call: ClientToolCall): void {
+    if (call.toolUseId) return;
+
+    const block: ToolUseBlock = {
+      type: "tool_use",
+      id: makeToolUseId(),
+      name: call.name,
+      input: call.input ?? {},
+    };
+    call.toolUseId = block.id;
+    this.toolUses.push(block);
+    this.syntheticToolUseIds.add(block.id);
+    for (const listener of this.syntheticToolUseListeners) {
+      listener(block);
+    }
+
+    const queued = this.queuedResults.get(block.id);
+    if (queued) {
+      this.queuedResults.delete(block.id);
+      this.resolveCall(call, queued);
+    }
+  }
+
+  private matchesPromotedSyntheticToolUse(block: ToolUseBlock): boolean {
+    return this.calls.some((call) => {
+      return (
+        !!call.toolUseId &&
+        this.syntheticToolUseIds.has(call.toolUseId) &&
+        call.name === block.name &&
+        sameJson(call.input, block.input)
+      );
+    });
+  }
+
   private resolveCall(call: ClientToolCall, result: ClientToolResultBlock): void {
     clearTimeout(call.timer);
     this.calls = this.calls.filter((item) => item.id !== call.id);
@@ -173,6 +229,9 @@ export class ClientToolTurn {
   stopReason: string | null = null;
   streamSink?: (event: any, raw: any) => void;
   private activeBlocks = new Map<number, ActiveBlock>();
+  private currentToolUseIds = new Set<string>();
+  private readyBatches: ClientToolUseBatch[] = [];
+  private readyBatchWaiters: Array<(batch: ClientToolUseBatch) => void> = [];
   private resolveInitialReady!: () => void;
   private initialReadyResolved = false;
 
@@ -186,6 +245,15 @@ export class ClientToolTurn {
     this.initialReady = new Promise((resolve) => {
       this.resolveInitialReady = resolve;
     });
+    this.bridge.onSyntheticToolUse((block) => {
+      this.toolUseIds.add(block.id);
+      this.enqueueReadyBatch({
+        messageId: this.messageId,
+        content: [{ ...block }],
+        toolUseIds: new Set([block.id]),
+        usage: { ...this.usage },
+      });
+    });
   }
 
   handleStreamEvent(event: any, raw: any): void {
@@ -194,6 +262,9 @@ export class ClientToolTurn {
 
     if (event.type === "message_start") {
       if (event.message?.id) this.messageId = event.message.id;
+      this.content.length = 0;
+      this.currentToolUseIds.clear();
+      this.stopReason = null;
       this.usage.input_tokens = event.message?.usage?.input_tokens || 0;
       this.usage.cache_creation_input_tokens =
         event.message?.usage?.cache_creation_input_tokens || 0;
@@ -247,9 +318,11 @@ export class ClientToolTurn {
           name: normalizedName,
           input: parseToolInput(active.inputJson || ""),
         };
-        this.content.push(block);
-        this.toolUseIds.add(block.id);
-        this.bridge.registerToolUse(block);
+        if (this.bridge.registerToolUse(block)) {
+          this.content.push(block);
+          this.toolUseIds.add(block.id);
+          this.currentToolUseIds.add(block.id);
+        }
       } else if (active.type === "text") {
         this.content.push({ type: "text", text: active.text || "" });
       } else if (active.raw) {
@@ -266,26 +339,69 @@ export class ClientToolTurn {
 
     if (
       event.type === "message_stop" &&
-      this.toolUseIds.size > 0 &&
+      this.currentToolUseIds.size > 0 &&
       this.stopReason === "tool_use" &&
-      !this.initialReadyResolved
+      this.content.some((block) => block.type === "tool_use")
     ) {
-      this.initialReadyResolved = true;
-      this.resolveInitialReady();
+      const batch: ClientToolUseBatch = {
+        messageId: this.messageId,
+        content: this.content.map((block) => ({ ...block })),
+        toolUseIds: new Set(this.currentToolUseIds),
+        usage: { ...this.usage },
+      };
+      this.enqueueReadyBatch(batch);
     }
   }
 
-  makeInitialMessage(): any {
+  takeReadyToolUseBatch(): ClientToolUseBatch | null {
+    return this.readyBatches.shift() || null;
+  }
+
+  waitForReadyToolUseBatch(): Promise<ClientToolUseBatch> {
+    const batch = this.takeReadyToolUseBatch();
+    if (batch) return Promise.resolve(batch);
+    return new Promise((resolve) => {
+      this.readyBatchWaiters.push(resolve);
+    });
+  }
+
+  makeToolUseMessage(batch: ClientToolUseBatch): any {
+    const toolUseContent = batch.content.filter((block) => {
+      return block.type === "tool_use" && batch.toolUseIds.has(String(block.id || ""));
+    });
     return {
-      id: this.messageId,
+      id: batch.messageId,
       type: "message",
       role: "assistant",
       model: this.model,
-      content: this.content,
+      content: toolUseContent.length > 0 ? toolUseContent : batch.content,
       stop_reason: "tool_use",
       stop_sequence: null,
-      usage: this.usage,
+      usage: batch.usage,
     };
+  }
+
+  makeInitialMessage(): any {
+    return this.makeToolUseMessage({
+      messageId: this.messageId,
+      content: this.content,
+      toolUseIds: new Set(this.currentToolUseIds),
+      usage: this.usage,
+    });
+  }
+
+  private enqueueReadyBatch(batch: ClientToolUseBatch): void {
+    const waiter = this.readyBatchWaiters.shift();
+    if (waiter) {
+      waiter(batch);
+    } else {
+      this.readyBatches.push(batch);
+    }
+
+    if (!this.initialReadyResolved) {
+      this.initialReadyResolved = true;
+      this.resolveInitialReady();
+    }
   }
 }
 
@@ -319,6 +435,10 @@ function parseToolInput(inputJson: string): unknown {
 
 function sameJson(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function makeToolUseId(): string {
+  return `toolu_${randomUUID().replace(/-/g, "")}`;
 }
 
 function formatMcpToolResult(result: ClientToolResultBlock): McpToolCallResult {

@@ -2,7 +2,7 @@ import http from "http";
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { URL } from "url";
 import {
   ClaudeContentBlock,
@@ -40,6 +40,10 @@ const LEGACY_CLIENT_API_KEY = process.env.CC_PROXY_API_KEY || "";
 const CONTROL_PLANE_PATH = path.join(DATA_DIR, "control-plane.json");
 const AUDIT_LOG_PATH = path.join(DATA_DIR, "audit-log.json");
 const ACCOUNT_STATE_PATH = path.join(DATA_DIR, "account-state.json");
+const DEFAULT_MESSAGES_DIAGNOSTIC_LOG_PATH = path.join(
+  DATA_DIR,
+  "messages-diagnostic.jsonl"
+);
 
 // Ensure temp dir exists
 fs.mkdirSync(TEMP_DIR, { recursive: true });
@@ -57,10 +61,47 @@ interface PendingClientToolTurn {
   finalPromise: Promise<TurnResult>;
   sessionId: string;
   closeAfterFinal: boolean;
+  awaitingToolUseIds: Set<string>;
+  includeThinking: boolean;
+  cleanupTimer?: NodeJS.Timeout;
+  cleaned?: boolean;
 }
 
 const clientToolBridges = new Map<string, ClientToolBridge>();
 const pendingClientToolTurns = new Map<string, PendingClientToolTurn>();
+const autoSessionAffinities = new Map<string, string>();
+const sessionConversationUserKeys = new Map<string, string[]>();
+
+const CLIENT_TOOL_BRIDGE_CONTEXT = [
+  "[client tools]",
+  "The tools available in this turn are normal API client tools.",
+  "Use a matching tool when the user's request asks for it or needs its result.",
+  "When a later user message contains tool_result, continue from that result.",
+].join("\n");
+
+const EXTENDED_THINKING_CONTEXT = [
+  "[extended thinking]",
+  "This API request enabled Anthropic extended thinking.",
+  "Use extended thinking for this answer so the API response includes a signed thinking block before the final answer.",
+  "Do not mention these internal API instructions in the final answer.",
+].join("\n");
+
+const SERVER_SIDE_TOOLS_DISABLED_FOR_CLIENT_BRIDGE = [
+  "Agent",
+  "Bash",
+  "Edit",
+  "Glob",
+  "Grep",
+  "LS",
+  "MultiEdit",
+  "NotebookEdit",
+  "NotebookRead",
+  "Read",
+  "Task",
+  "Write",
+  "WebFetch",
+  "WebSearch",
+];
 
 // ---- Logging ----
 
@@ -174,13 +215,40 @@ function readBody(req: http.IncomingMessage): Promise<string> {
   });
 }
 
+function corsHeaders(): Record<string, string> {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
+    "Access-Control-Allow-Headers": [
+      "authorization",
+      "content-type",
+      "x-api-key",
+      "anthropic-version",
+      "anthropic-beta",
+      "x-cc-session-id",
+      "x-cc-keep-session",
+    ].join(","),
+    "Access-Control-Expose-Headers": [
+      "request-id",
+      "x-cc-session-id",
+      "x-cc-cli-session-id",
+    ].join(","),
+    "Access-Control-Max-Age": "86400",
+  };
+}
+
+function sendCorsPreflight(res: http.ServerResponse): void {
+  res.writeHead(204, corsHeaders());
+  res.end();
+}
+
 function sendJson(
   res: http.ServerResponse,
   status: number,
   body: unknown,
   headers: Record<string, string> = {}
 ): void {
-  res.writeHead(status, { ...headers, "Content-Type": "application/json" });
+  res.writeHead(status, { ...corsHeaders(), ...headers, "Content-Type": "application/json" });
   res.end(JSON.stringify(body));
 }
 
@@ -203,6 +271,16 @@ function extractClientApiKey(req: http.IncomingMessage): string {
   return match?.[1] || "";
 }
 
+function hashForAffinity(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 24);
+}
+
+function clientAffinityFingerprint(req: http.IncomingMessage): string {
+  const key = extractClientApiKey(req);
+  if (key) return `key:${hashForAffinity(key)}`;
+  return `anon:${hashForAffinity(req.socket.remoteAddress || "unknown")}`;
+}
+
 function sendAnthropicError(
   res: http.ServerResponse,
   status: number,
@@ -216,6 +294,161 @@ function sendAnthropicError(
     { type: "error", error: { type, message }, request_id: requestId },
     { "request-id": requestId }
   );
+}
+
+function anthropicDiagnosticLogEnabled(): boolean {
+  return /^(1|true|yes)$/i.test(process.env.CC_PROXY_DIAGNOSTIC_LOG || "") ||
+    !!process.env.CC_PROXY_MESSAGES_LOG_PATH;
+}
+
+function anthropicDiagnosticLogPath(): string {
+  return process.env.CC_PROXY_MESSAGES_LOG_PATH ||
+    DEFAULT_MESSAGES_DIAGNOSTIC_LOG_PATH;
+}
+
+function truncateDiagnosticString(value: string, max = 2000): string {
+  if (value.length <= max) return value;
+  return `${value.slice(0, max)}...[truncated ${value.length - max} chars]`;
+}
+
+function truncateDiagnosticValue(value: any, depth = 0): any {
+  if (depth > 8) return "[max-depth]";
+  if (typeof value === "string") return truncateDiagnosticString(value);
+  if (typeof value !== "object" || value === null) return value;
+  if (Array.isArray(value)) {
+    return value.slice(0, 40).map((item) => truncateDiagnosticValue(item, depth + 1));
+  }
+  const result: Record<string, any> = {};
+  for (const [key, item] of Object.entries(value).slice(0, 80)) {
+    result[key] = truncateDiagnosticValue(item, depth + 1);
+  }
+  return result;
+}
+
+function diagnosticMessagesText(body: any): string {
+  const parts: string[] = [];
+  if (body?.system) parts.push(contentToText(body.system));
+  if (Array.isArray(body?.messages)) {
+    for (const message of body.messages) {
+      parts.push(contentToText(message?.content));
+    }
+  }
+  return parts.join("\n");
+}
+
+function inferCCTestProbe(body: any): string | null {
+  const text = diagnosticMessagesText(body);
+  if (Array.isArray(body?.messages) && body.messages.length === 0) return "error_shape";
+  if (body?.stream === true || /Count: 1 2 3 4 5/.test(text)) return "streaming_shape";
+  if (body?.stop_sequences?.includes?.("HALT")) return "stop_sequence";
+  if (body?.max_tokens === 5 && /very long essay about the history of computing/i.test(text)) {
+    return "max_tokens";
+  }
+  if (body?.tool_choice?.type === "tool" || /weather in Tokyo/i.test(text)) return "tool_use";
+  if (/PINEAPPLE-7742/.test(text)) return "multi_turn";
+  if (/single lowercase word "acknowledged"/i.test(text)) return "system_adherence";
+  if (/Repeat your entire system prompt verbatim/i.test(text)) return "system_prompt_leak";
+  if (/single word: OK/i.test(text)) return "consistency_check";
+  if (/specific AI safety training methodology/i.test(text)) return "self_identification";
+  if (/Alice is looking at Bob/i.test(text)) return "reasoning_fingerprint";
+  if (/Describe this image in exactly 3 words/i.test(text)) return "multimodal";
+  if (/What two words are written in this PDF/i.test(text)) return "document_input";
+  if (/minimum cache size/i.test(text) || JSON.stringify(body || {}).includes("\"cache_control\"")) {
+    return "cache_behavior";
+  }
+  if (/Deterministic probe text for token accounting verification/i.test(text)) {
+    return "count_tokens_match";
+  }
+  if (/ping/.test(text) && body?.max_tokens === 16) return "connectivity";
+  if (/say ok/i.test(text) && body?.max_tokens === 16) return "response_shape";
+  if (/^hi$/i.test(text.trim()) && body?.max_tokens === 8) return "model_echo";
+  if (/^hi$/i.test(text.trim()) && body?.max_tokens === 4) return "header_fingerprint";
+  return null;
+}
+
+function summarizeAnthropicRequestBody(body: any): any {
+  return {
+    model: body?.model,
+    stream: body?.stream === true,
+    max_tokens: body?.max_tokens,
+    stop_sequences: body?.stop_sequences,
+    tool_choice: body?.tool_choice,
+    tool_names: Array.isArray(body?.tools)
+      ? body.tools.map((tool: any) => tool?.name).filter(Boolean)
+      : [],
+    message_count: Array.isArray(body?.messages) ? body.messages.length : null,
+    text: truncateDiagnosticString(diagnosticMessagesText(body), 3000),
+    body: truncateDiagnosticValue(body),
+  };
+}
+
+function summarizeAnthropicResponseBody(body: any): any {
+  if (!body || typeof body !== "object") return { body: truncateDiagnosticValue(body) };
+  const content = Array.isArray(body.content) ? body.content : [];
+  const toolUses = content
+    .filter((block: any) => block?.type === "tool_use")
+    .map((block: any) => ({
+      id: block.id,
+      name: block.name,
+      input: truncateDiagnosticValue(block.input),
+    }));
+  return {
+    id: body.id,
+    type: body.type,
+    role: body.role,
+    model: body.model,
+    stop_reason: body.stop_reason,
+    stop_sequence: body.stop_sequence,
+    content_types: content.map((block: any) => block?.type || "unknown"),
+    text: truncateDiagnosticString(extractTextFromAnthropicContent(content), 3000),
+    tool_uses: toolUses,
+    usage: body.usage,
+    error: body.error,
+    request_id: body.request_id,
+    body: truncateDiagnosticValue(body),
+  };
+}
+
+function extractTextFromAnthropicContent(content: any): string {
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((block: any) => block?.type === "text" && typeof block.text === "string")
+    .map((block: any) => block.text)
+    .join("");
+}
+
+function writeAnthropicDiagnostic(
+  req: http.IncomingMessage,
+  requestId: string,
+  phase: "request" | "response" | "error",
+  body: any,
+  details: Record<string, any> = {}
+): void {
+  if (!anthropicDiagnosticLogEnabled()) return;
+  try {
+    const record = {
+      at: new Date().toISOString(),
+      phase,
+      route: "/v1/messages",
+      request_id: requestId,
+      inferred_probe: inferCCTestProbe(body),
+      remote_address: req.socket.remoteAddress || null,
+      user_agent: headerValue(req, "user-agent") || null,
+      auth_prefix: extractClientApiKey(req).slice(0, 12),
+      request: summarizeAnthropicRequestBody(body),
+      ...details,
+    };
+    fs.mkdirSync(path.dirname(anthropicDiagnosticLogPath()), { recursive: true });
+    fs.appendFileSync(
+      anthropicDiagnosticLogPath(),
+      `${JSON.stringify(record)}\n`,
+      "utf8"
+    );
+  } catch (err) {
+    log("WARN", "Failed to write Anthropic diagnostic log", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 function requireClientAuth(
@@ -385,6 +618,8 @@ function claudeRunnerOptionsFromConfig(
     mcpConfig: overrides.mcpConfig,
     strictMcpConfig: overrides.strictMcpConfig,
     allowedTools: overrides.allowedTools,
+    disallowedTools: overrides.disallowedTools,
+    tools: overrides.tools,
   };
 }
 
@@ -401,6 +636,96 @@ function normalizeClientTools(tools: any): ClientToolSpec[] {
     .filter((tool) => tool.name);
 }
 
+type AnthropicToolChoice =
+  | { type: "auto" }
+  | { type: "any" }
+  | { type: "none" }
+  | { type: "tool"; name: string };
+
+function normalizeAnthropicToolChoice(
+  toolChoice: any,
+  tools: ClientToolSpec[]
+):
+  | { ok: true; choice: AnthropicToolChoice; tools: ClientToolSpec[] }
+  | { ok: false; status?: number; type?: string; message: string } {
+  if (toolChoice == null) return { ok: true, choice: { type: "auto" }, tools };
+  if (typeof toolChoice !== "object" || Array.isArray(toolChoice)) {
+    return {
+      ok: false,
+      status: 400,
+      type: "invalid_request_error",
+      message: "tool_choice must be an object",
+    };
+  }
+
+  const choiceType = toolChoice.type;
+  if (choiceType === "auto") return { ok: true, choice: { type: "auto" }, tools };
+  if (choiceType === "none") return { ok: true, choice: { type: "none" }, tools: [] };
+
+  if (choiceType === "any") {
+    if (tools.length === 0) {
+      return {
+        ok: false,
+        status: 400,
+        type: "invalid_request_error",
+        message: "tool_choice 'any' requires at least one tool",
+      };
+    }
+    return { ok: true, choice: { type: "any" }, tools };
+  }
+
+  if (choiceType === "tool") {
+    const name = typeof toolChoice.name === "string" ? toolChoice.name : "";
+    if (!name) {
+      return {
+        ok: false,
+        status: 400,
+        type: "invalid_request_error",
+        message: "tool_choice 'tool' requires a tool name",
+      };
+    }
+    if (!tools.some((tool) => tool.name === name)) {
+      return {
+        ok: false,
+        status: 400,
+        type: "invalid_request_error",
+        message: `tool_choice references unknown tool: ${name}`,
+      };
+    }
+    return { ok: true, choice: { type: "tool", name }, tools };
+  }
+
+  return {
+    ok: false,
+    status: 400,
+    type: "invalid_request_error",
+    message: `Unsupported tool_choice type: ${String(choiceType)}`,
+  };
+}
+
+function makeClientToolChoiceContext(
+  choice: AnthropicToolChoice,
+  tools: ClientToolSpec[]
+): string {
+  if (choice.type === "tool") {
+    return [
+      "[tool_choice]",
+      `The API request requires a tool call. You must use the client tool named ${choice.name} before giving the final answer.`,
+      "Do not answer with only text before that required tool call.",
+    ].join("\n");
+  }
+  if (choice.type === "any") {
+    const names = tools.map((tool) => tool.name).join(", ");
+    return [
+      "[tool_choice]",
+      `The API request requires a tool call. You must use at least one available client tool before giving the final answer.`,
+      `Available client tools: ${names}.`,
+      "Do not answer with only text before that required tool call.",
+    ].join("\n");
+  }
+  return "";
+}
+
 function makeClientToolMcpConfig(bridge: ClientToolBridge): string {
   return JSON.stringify({
     mcpServers: {
@@ -411,14 +736,18 @@ function makeClientToolMcpConfig(bridge: ClientToolBridge): string {
         env: {
           CC_PROXY_CLIENT_TOOL_BRIDGE_URL: `http://127.0.0.1:${PORT}/internal/tool-bridge/${bridge.id}`,
           CC_PROXY_CLIENT_TOOL_BRIDGE_TOKEN: bridge.token,
+          ...(process.env.CC_PROXY_CLIENT_TOOL_BRIDGE_DEBUG === "1"
+            ? {
+                CC_PROXY_CLIENT_TOOL_BRIDGE_LOG: path.join(
+                  os.tmpdir(),
+                  `cc-proxy-client-tool-bridge-${bridge.id}.log`
+                ),
+              }
+            : {}),
         },
       },
     },
   });
-}
-
-function makeClientToolAllowedTools(tools: ClientToolSpec[]): string[] {
-  return tools.map((tool) => `mcp__cc_client_tools__${tool.name}`);
 }
 
 function findPendingClientToolTurn(toolUseIds: string[]): PendingClientToolTurn | null {
@@ -429,22 +758,42 @@ function findPendingClientToolTurn(toolUseIds: string[]): PendingClientToolTurn 
   return null;
 }
 
+function unregisterPendingClientToolTurn(pending: PendingClientToolTurn): void {
+  for (const [id, registered] of pendingClientToolTurns) {
+    if (registered === pending) {
+      pendingClientToolTurns.delete(id);
+    }
+  }
+}
+
+function armPendingClientToolTurnCleanup(pending: PendingClientToolTurn): void {
+  if (pending.cleanupTimer) clearTimeout(pending.cleanupTimer);
+  pending.cleanupTimer = setTimeout(() => {
+    cleanupPendingClientToolTurn(pending);
+  }, controlPlane.getConfig().client_tool_timeout_ms);
+  pending.cleanupTimer.unref?.();
+}
+
 function registerPendingClientToolTurn(pending: PendingClientToolTurn): void {
-  for (const id of pending.turn.toolUseIds) {
+  if (pending.cleaned) return;
+  unregisterPendingClientToolTurn(pending);
+  armPendingClientToolTurnCleanup(pending);
+  for (const id of pending.awaitingToolUseIds) {
     pendingClientToolTurns.set(id, pending);
   }
 }
 
 function cleanupPendingClientToolTurn(pending: PendingClientToolTurn): void {
-  for (const id of pending.turn.toolUseIds) {
-    if (pendingClientToolTurns.get(id) === pending) {
-      pendingClientToolTurns.delete(id);
-    }
-  }
+  if (pending.cleaned) return;
+  pending.cleaned = true;
+  if (pending.cleanupTimer) clearTimeout(pending.cleanupTimer);
+  pending.cleanupTimer = undefined;
+  unregisterPendingClientToolTurn(pending);
   pending.turn.bridge.dispose();
   clientToolBridges.delete(pending.turn.bridge.id);
   if (pending.closeAfterFinal) {
     sessions.close(pending.sessionId);
+    forgetSessionState(pending.sessionId);
   }
 }
 
@@ -467,18 +816,167 @@ function contentToText(content: any): string {
   return JSON.stringify(content);
 }
 
+function firstConversationUserText(body: any): string {
+  const firstUser = Array.isArray(body?.messages)
+    ? body.messages.find((message: any) => message?.role === "user")
+    : null;
+  if (firstUser) return contentToText(firstUser.content);
+  const firstMessage = Array.isArray(body?.messages) ? body.messages[0] : null;
+  return contentToText(firstMessage?.content);
+}
+
+function makeAutoSessionAffinityKey(
+  req: http.IncomingMessage,
+  body: any,
+  turnInput: { model: string; effort?: string; tools: ClientToolSpec[] }
+): string | null {
+  if (turnInput.tools.length > 0) return null;
+  const parts = {
+    client: clientAffinityFingerprint(req),
+    model: turnInput.model,
+    effort: turnInput.effort || "",
+    system: contentToText(body?.system),
+    first_user: firstConversationUserText(body),
+  };
+  return hashForAffinity(JSON.stringify(parts));
+}
+
+function findReusableAutoSession(affinityKey: string | null): string | null {
+  if (!affinityKey) return null;
+  const sessionId = autoSessionAffinities.get(affinityKey);
+  if (!sessionId) return null;
+  const info = sessions.get(sessionId);
+  if (!info || info.state !== "ready") {
+    autoSessionAffinities.delete(affinityKey);
+    return null;
+  }
+  return sessionId;
+}
+
+function rememberAutoSession(affinityKey: string | null, sessionId: string): void {
+  if (affinityKey) autoSessionAffinities.set(affinityKey, sessionId);
+}
+
+function forgetAutoSession(sessionId: string): void {
+  for (const [key, mappedSessionId] of autoSessionAffinities) {
+    if (mappedSessionId === sessionId) autoSessionAffinities.delete(key);
+  }
+}
+
+function forgetSessionState(sessionId: string): void {
+  forgetAutoSession(sessionId);
+  sessionConversationUserKeys.delete(sessionId);
+}
+
+function conversationUserKey(message: ClaudeStreamMessage): string | null {
+  if (message.type !== "user") return null;
+  return hashForAffinity(JSON.stringify(message.message.content));
+}
+
+function conversationUserKeys(messages: ClaudeStreamMessage[]): string[] {
+  const keys: string[] = [];
+  for (const message of messages) {
+    const key = conversationUserKey(message);
+    if (key) keys.push(key);
+  }
+  return keys;
+}
+
+function matchingUserPrefixCount(knownKeys: string[], incomingKeys: string[]): number {
+  let count = 0;
+  while (
+    count < knownKeys.length &&
+    count < incomingKeys.length &&
+    knownKeys[count] === incomingKeys[count]
+  ) {
+    count += 1;
+  }
+  return count;
+}
+
+function messageIndexAfterUserCount(
+  messages: ClaudeStreamMessage[],
+  userCount: number
+): number {
+  if (userCount <= 0) return 0;
+  let seen = 0;
+  for (let i = 0; i < messages.length; i += 1) {
+    if (messages[i].type !== "user") continue;
+    seen += 1;
+    if (seen === userCount) return i + 1;
+  }
+  return messages.length;
+}
+
+function stripLeadingAssistantHistory(
+  messages: ClaudeStreamMessage[]
+): ClaudeStreamMessage[] {
+  let start = 0;
+  while (start < messages.length && messages[start].type === "assistant") {
+    start += 1;
+  }
+  return messages.slice(start);
+}
+
+function prepareMessagesForSessionTurn(
+  sessionId: string,
+  incomingMessages: ClaudeStreamMessage[],
+  reusingSession: boolean
+): { messages: ClaudeStreamMessage[]; userKeysAfterTurn: string[] } {
+  const incomingUserKeys = conversationUserKeys(incomingMessages);
+  if (!reusingSession) {
+    return { messages: incomingMessages, userKeysAfterTurn: incomingUserKeys };
+  }
+
+  const knownUserKeys = sessionConversationUserKeys.get(sessionId) || [];
+  if (knownUserKeys.length === 0) {
+    return { messages: incomingMessages, userKeysAfterTurn: incomingUserKeys };
+  }
+
+  const prefixCount = matchingUserPrefixCount(knownUserKeys, incomingUserKeys);
+  if (prefixCount > 0) {
+    const afterKnownUserIndex = messageIndexAfterUserCount(incomingMessages, prefixCount);
+    const suffix = stripLeadingAssistantHistory(
+      incomingMessages.slice(afterKnownUserIndex)
+    );
+    return {
+      messages: suffix.length > 0 ? suffix : incomingMessages,
+      userKeysAfterTurn: incomingUserKeys,
+    };
+  }
+
+  return {
+    messages: incomingMessages,
+    userKeysAfterTurn: [...knownUserKeys, ...incomingUserKeys],
+  };
+}
+
 function contentToBlocks(content: any): ClaudeContentBlock[] {
   if (typeof content === "string") return [{ type: "text", text: content }];
   if (Array.isArray(content)) {
     return content.map((block) => {
       if (block && typeof block === "object" && typeof block.type === "string") {
-        return block as ClaudeContentBlock;
+        return sanitizeContentBlockForClaudeCli(block);
       }
       return { type: "text", text: String(block ?? "") };
     });
   }
   if (content == null) return [];
   return [{ type: "text", text: JSON.stringify(content) }];
+}
+
+function sanitizeContentBlockForClaudeCli(block: any): ClaudeContentBlock {
+  const clean: ClaudeContentBlock = { ...block };
+  delete clean.cache_control;
+  if (Array.isArray(clean.content)) {
+    clean.content = clean.content.map((nested) => {
+      if (nested && typeof nested === "object" && typeof nested.type === "string") {
+        return sanitizeContentBlockForClaudeCli(nested);
+      }
+      return nested;
+    });
+  }
+  return clean;
 }
 
 function makeClaudeStreamMessage(message: any): ClaudeStreamMessage {
@@ -492,15 +990,52 @@ function makeClaudeStreamMessage(message: any): ClaudeStreamMessage {
   };
 }
 
+function isPlainTextContent(content: any): boolean {
+  if (typeof content === "string") return true;
+  if (!Array.isArray(content)) return content == null;
+  return content.every((block) => block?.type === "text" && typeof block.text === "string");
+}
+
+function collapsePlainTextConversation(
+  messages: ClaudeStreamMessage[]
+): ClaudeStreamMessage[] {
+  if (messages.length <= 1) return messages;
+  const transcript = messages.map((message, index) => {
+    const role = message.message.role === "assistant" ? "Assistant" : "User";
+    return `${index + 1}. ${role}: ${contentToText(message.message.content)}`;
+  }).join("\n");
+  const collapsedText = [
+    "[conversation history]",
+    transcript,
+    "",
+    "Continue this conversation and answer the latest user message according to the prior turns.",
+    "Do not answer earlier user messages again.",
+  ].join("\n");
+  return [
+    {
+      type: "user",
+      message: {
+        role: "user",
+        content: [{ type: "text", text: collapsedText }],
+      },
+      parent_tool_use_id: null,
+    },
+  ];
+}
+
 function addContextToFirstUserMessage(
   messages: ClaudeStreamMessage[],
-  context: string
+  context: string,
+  placement: "prepend" | "append" = "prepend"
 ): ClaudeStreamMessage[] {
   if (!context) return messages;
   const contextBlock: ClaudeContentBlock = { type: "text", text: context };
   const firstUser = messages.find((message) => message.type === "user");
   if (firstUser) {
-    firstUser.message.content = [contextBlock, ...firstUser.message.content];
+    firstUser.message.content =
+      placement === "append"
+        ? [...firstUser.message.content, contextBlock]
+        : [contextBlock, ...firstUser.message.content];
     return messages;
   }
   return [
@@ -520,6 +1055,9 @@ function buildTurnInputFromAnthropicMessages(body: any):
       model: string;
       effort?: string;
       tools: ClientToolSpec[];
+      maxTokens?: number;
+      stopSequences: string[];
+      shouldCollapsePlainTextHistory: boolean;
     }
   | { ok: false; status?: number; type?: string; message: string } {
   if (!body || typeof body !== "object") {
@@ -531,11 +1069,21 @@ function buildTurnInputFromAnthropicMessages(body: any):
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     return { ok: false, message: "Missing non-empty 'messages' array" };
   }
-  const tools = normalizeClientTools(body.tools);
+  const requestedTools = normalizeClientTools(body.tools);
+  const toolChoiceResult = normalizeAnthropicToolChoice(
+    body.tool_choice,
+    requestedTools
+  );
+  if (!toolChoiceResult.ok) return toolChoiceResult;
+  const tools = toolChoiceResult.tools;
 
-  const contextParts: string[] = [];
+  const prependContextParts: string[] = [];
+  const appendContextParts: string[] = [];
   if (body.system) {
-    contextParts.push(`[system]\n${contentToText(body.system)}`);
+    prependContextParts.push(`[system]\n${contentToText(body.system)}`);
+  }
+  if (wantsAnthropicThinking(body)) {
+    appendContextParts.push(EXTENDED_THINKING_CONTEXT);
   }
   const messages: ClaudeStreamMessage[] = [];
   for (const message of body.messages) {
@@ -548,13 +1096,55 @@ function buildTurnInputFromAnthropicMessages(body: any):
     messages.push(makeClaudeStreamMessage(message));
   }
 
+  const allPlainText = body.messages.every((message: any) => {
+    return isPlainTextContent(message?.content);
+  });
+  const shouldCollapsePlainTextHistory =
+    tools.length === 0 && allPlainText && messages.length > 1;
+
+  let messagesWithContext = addContextToFirstUserMessage(
+    messages,
+    prependContextParts.join("\n\n")
+  );
+  messagesWithContext = addContextToFirstUserMessage(
+    messagesWithContext,
+    appendContextParts.join("\n\n"),
+    "append"
+  );
+  const clientToolContext = [
+    CLIENT_TOOL_BRIDGE_CONTEXT,
+    makeClientToolChoiceContext(toolChoiceResult.choice, tools),
+  ].filter(Boolean).join("\n\n");
   return {
     ok: true,
-    messages: addContextToFirstUserMessage(messages, contextParts.join("\n\n")),
+    messages: tools.length > 0
+      ? addContextToFirstUserMessage(
+          messagesWithContext,
+          clientToolContext,
+          "append"
+        )
+      : messagesWithContext,
     model: body.model,
     effort: thinkingToClaudeEffort(body.thinking),
     tools,
+    maxTokens: normalizeMaxTokens(body.max_tokens),
+    stopSequences: normalizeStopSequences(body.stop_sequences),
+    shouldCollapsePlainTextHistory,
   };
+}
+
+function normalizeMaxTokens(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n <= 0) return undefined;
+  return n;
+}
+
+function normalizeStopSequences(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => {
+    return typeof item === "string" && item.length > 0;
+  });
 }
 
 function thinkingToClaudeEffort(thinking: any): string | undefined {
@@ -562,33 +1152,385 @@ function thinkingToClaudeEffort(thinking: any): string | undefined {
   if (thinking.type !== "enabled") return undefined;
 
   const budget = Number(thinking.budget_tokens);
-  if (!Number.isFinite(budget) || budget <= 0) return "medium";
-  if (budget <= 4_096) return "low";
-  if (budget <= 16_000) return "medium";
+  if (!Number.isFinite(budget) || budget <= 0) return "high";
   if (budget <= 32_000) return "high";
   if (budget <= 64_000) return "xhigh";
   return "max";
 }
 
-function makeAnthropicMessage(model: string, result: any): any {
+function wantsAnthropicThinking(body: any): boolean {
+  return body?.thinking?.type === "enabled";
+}
+
+function usageNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function normalizeAnthropicUsageForClients(): boolean {
+  return /^(1|true|yes)$/i.test(process.env.CC_PROXY_NORMALIZE_ANTHROPIC_USAGE || "");
+}
+
+function autoSessionAffinityEnabled(): boolean {
+  return /^(1|true|yes)$/i.test(process.env.CC_PROXY_AUTO_SESSION_AFFINITY || "");
+}
+
+function truthyHeader(value: string): boolean {
+  return /^(1|true|yes)$/i.test(value || "");
+}
+
+function anthropicCacheUsageNumber(value: unknown): number {
+  return normalizeAnthropicUsageForClients() ? 0 : usageNumber(value);
+}
+
+function makeAnthropicUsage(usage: any = {}): {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+} {
+  return {
+    input_tokens: usageNumber(usage.input_tokens),
+    output_tokens: usageNumber(usage.output_tokens),
+    cache_creation_input_tokens: anthropicCacheUsageNumber(usage.cache_creation_input_tokens),
+    cache_read_input_tokens: anthropicCacheUsageNumber(usage.cache_read_input_tokens),
+  };
+}
+
+function pickAnthropicUsageFields(usage: any): Record<string, number> {
+  const result: Record<string, number> = {};
+  if (!usage || typeof usage !== "object") return result;
+  for (const field of [
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+  ]) {
+    const value = usage[field];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      result[field] = field.startsWith("cache_") && normalizeAnthropicUsageForClients()
+        ? 0
+        : value;
+    }
+  }
+  return result;
+}
+
+function isThinkingBlock(block: any): boolean {
+  return block?.type === "thinking" || block?.type === "redacted_thinking";
+}
+
+function isThinkingDelta(delta: any): boolean {
+  return (
+    delta?.type === "thinking_delta" ||
+    delta?.type === "signature_delta" ||
+    delta?.type === "redacted_thinking_delta"
+  );
+}
+
+function normalizeAnthropicContent(
+  content: any,
+  fallbackText = "",
+  options: { includeThinking?: boolean; ensureTextFallback?: boolean } = {}
+): ClaudeContentBlock[] {
+  const blocks: ClaudeContentBlock[] = [];
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (!block || typeof block !== "object" || typeof block.type !== "string") {
+        continue;
+      }
+      if (!options.includeThinking && isThinkingBlock(block)) {
+        continue;
+      }
+      blocks.push({ ...block });
+    }
+  }
+
+  if (blocks.length > 0) return blocks;
+  if (options.ensureTextFallback === false) return [];
+  return [{ type: "text", text: fallbackText }];
+}
+
+function normalizeAnthropicMessageObject(
+  message: any,
+  options: { includeThinking?: boolean } = {}
+): any {
+  return {
+    ...message,
+    content: normalizeAnthropicContent(message?.content, "", {
+      includeThinking: options.includeThinking,
+    }),
+    usage: makeAnthropicUsage(message?.usage || {}),
+  };
+}
+
+function textFromBlock(block: ClaudeContentBlock): string {
+  return typeof block.text === "string" ? block.text : "";
+}
+
+function findEarliestStopSequence(
+  text: string,
+  stopSequences: string[]
+): { sequence: string; index: number } | null {
+  let best: { sequence: string; index: number } | null = null;
+  for (const sequence of stopSequences) {
+    const index = text.indexOf(sequence);
+    if (index < 0) continue;
+    if (!best || index < best.index) {
+      best = { sequence, index };
+    }
+  }
+  return best;
+}
+
+function truncateTextContentAtChars(
+  content: ClaudeContentBlock[],
+  charLimit: number
+): ClaudeContentBlock[] {
+  const truncated: ClaudeContentBlock[] = [];
+  let remaining = Math.max(0, charLimit);
+  let reachedLimit = false;
+
+  for (const block of content) {
+    if (reachedLimit) break;
+    if (block.type !== "text") {
+      truncated.push(block);
+      continue;
+    }
+
+    const text = textFromBlock(block);
+    if (remaining >= text.length) {
+      truncated.push(block);
+      remaining -= text.length;
+      continue;
+    }
+
+    truncated.push({ ...block, text: text.slice(0, remaining) });
+    reachedLimit = true;
+  }
+
+  return truncated.length > 0 ? truncated : [{ type: "text", text: "" }];
+}
+
+function applyAnthropicOutputControls(
+  content: ClaudeContentBlock[],
+  usage: ReturnType<typeof makeAnthropicUsage>,
+  stopReason: string,
+  options: { maxTokens?: number; stopSequences?: string[] }
+): {
+  content: ClaudeContentBlock[];
+  usage: ReturnType<typeof makeAnthropicUsage>;
+  stopReason: string;
+  stopSequence: string | null;
+} {
+  let nextContent = content;
+  let nextStopReason = stopReason || "end_turn";
+  let stopSequence: string | null = null;
+  const nextUsage = { ...usage };
+  const text = nextContent
+    .filter((block) => block.type === "text")
+    .map(textFromBlock)
+    .join("");
+
+  const stopMatch = findEarliestStopSequence(text, options.stopSequences || []);
+  if (stopMatch) {
+    nextContent = truncateTextContentAtChars(nextContent, stopMatch.index);
+    nextStopReason = "stop_sequence";
+    stopSequence = stopMatch.sequence;
+  }
+
+  if (
+    options.maxTokens !== undefined &&
+    nextUsage.output_tokens > options.maxTokens
+  ) {
+    nextUsage.output_tokens = options.maxTokens;
+    if (!stopMatch && text.length > 0) {
+      nextContent = truncateTextContentAtChars(
+        nextContent,
+        Math.max(0, options.maxTokens * 4)
+      );
+      nextStopReason = "max_tokens";
+      stopSequence = null;
+    }
+  }
+
+  return {
+    content: nextContent,
+    usage: nextUsage,
+    stopReason: nextStopReason,
+    stopSequence,
+  };
+}
+
+function normalizeAnthropicStreamEvent(
+  event: any,
+  state: {
+    includeThinking: boolean;
+    hiddenIndexes: Set<number>;
+    visibleIndexes: Map<number, number>;
+    nextVisibleIndex: number;
+  }
+): any | null {
+  if (!event || typeof event !== "object") return event;
+
+  const upstreamIndex = (): number => {
+    return typeof event.index === "number" ? event.index : state.nextVisibleIndex;
+  };
+  const downstreamIndex = (index: number): number => {
+    const existing = state.visibleIndexes.get(index);
+    if (existing !== undefined) return existing;
+    const next = state.nextVisibleIndex;
+    state.nextVisibleIndex += 1;
+    state.visibleIndexes.set(index, next);
+    return next;
+  };
+
+  if (event.type === "message_start") {
+    return {
+      ...event,
+      message: {
+        ...event.message,
+        content: [],
+        usage: makeAnthropicUsage(event.message?.usage || {}),
+      },
+    };
+  }
+
+  if (event.type === "content_block_start") {
+    const index = upstreamIndex();
+    if (!state.includeThinking && isThinkingBlock(event.content_block)) {
+      state.hiddenIndexes.add(index);
+      return null;
+    }
+    return {
+      ...event,
+      index: downstreamIndex(index),
+      content_block:
+        event.content_block && typeof event.content_block === "object"
+          ? { ...event.content_block }
+          : event.content_block,
+    };
+  }
+
+  if (event.type === "content_block_delta") {
+    const index = upstreamIndex();
+    if (state.hiddenIndexes.has(index)) return null;
+    if (!state.includeThinking && isThinkingDelta(event.delta)) return null;
+    return {
+      ...event,
+      index: downstreamIndex(index),
+      delta:
+        event.delta && typeof event.delta === "object"
+          ? { ...event.delta }
+          : event.delta,
+    };
+  }
+
+  if (event.type === "content_block_stop") {
+    const index = upstreamIndex();
+    if (state.hiddenIndexes.has(index)) {
+      state.hiddenIndexes.delete(index);
+      return null;
+    }
+    return { ...event, index: downstreamIndex(index) };
+  }
+
+  if (event.type === "message_delta") {
+    const normalized: any = { ...event };
+    if ("usage" in event) normalized.usage = pickAnthropicUsageFields(event.usage);
+    return normalized;
+  }
+
+  const normalized: any = { ...event };
+  if ("usage" in event) normalized.usage = pickAnthropicUsageFields(event.usage);
+  return normalized;
+}
+
+function makeAnthropicStreamEventNormalizer(
+  includeThinking: boolean
+): (event: any) => any | null {
+  const state = {
+    includeThinking,
+    hiddenIndexes: new Set<number>(),
+    visibleIndexes: new Map<number, number>(),
+    nextVisibleIndex: 0,
+  };
+  return (event: any) => normalizeAnthropicStreamEvent(event, state);
+}
+
+function estimateInputTokens(
+  messages: ClaudeStreamMessage[],
+  tools: ClientToolSpec[]
+): number {
+  const text = [
+    ...messages.map((message) => {
+      return `${message.message.role}\n${contentToText(message.message.content)}`;
+    }),
+    tools.length > 0 ? JSON.stringify(tools) : "",
+  ].join("\n");
+  const bytes = Buffer.byteLength(text, "utf-8");
+  const words = text.trim() ? text.trim().split(/\s+/).length : 0;
+  return Math.max(1, Math.ceil(bytes / 4), Math.ceil(words * 1.3));
+}
+
+async function handleAnthropicCountTokens(
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+): Promise<void> {
+  const requestId = makeAnthropicRequestId();
+  if (!requireClientAuth(req, res, "anthropic", requestId)) return;
+
+  const bodyText = await readBody(req);
+  let body: any;
+  try {
+    body = JSON.parse(bodyText);
+  } catch {
+    sendAnthropicError(res, 400, "invalid_request_error", "Invalid JSON body", requestId);
+    return;
+  }
+
+  const turnInputResult = buildTurnInputFromAnthropicMessages(body);
+  if (!turnInputResult.ok) {
+    sendAnthropicError(
+      res,
+      turnInputResult.status || 400,
+      turnInputResult.type || "invalid_request_error",
+      turnInputResult.message,
+      requestId
+    );
+    return;
+  }
+
+  sendJson(
+    res,
+    200,
+    { input_tokens: estimateInputTokens(turnInputResult.messages, turnInputResult.tools) },
+    { "request-id": requestId }
+  );
+}
+
+function makeAnthropicMessage(
+  model: string,
+  result: any,
+  options: { includeThinking?: boolean; maxTokens?: number; stopSequences?: string[] } = {}
+): any {
+  const content = normalizeAnthropicContent(result.content, result.result || "", {
+    includeThinking: options.includeThinking,
+  });
+  const controlled = applyAnthropicOutputControls(
+    content,
+    makeAnthropicUsage(result.usage || {}),
+    result.stop_reason || "end_turn",
+    options
+  );
   return {
     id: `msg_${randomUUID().replace(/-/g, "")}`,
     type: "message",
     role: "assistant",
     model,
-    content:
-      Array.isArray(result.content) && result.content.length > 0
-        ? result.content
-        : [{ type: "text", text: result.result }],
-    stop_reason: result.stop_reason || "end_turn",
-    stop_sequence: null,
-    usage: {
-      input_tokens: result.usage.input_tokens,
-      output_tokens: result.usage.output_tokens,
-      cache_creation_input_tokens: result.usage.cache_creation_input_tokens,
-      cache_read_input_tokens: result.usage.cache_read_input_tokens,
-      total_cost_usd: result.usage.total_cost_usd,
-    },
+    content: controlled.content,
+    stop_reason: controlled.stopReason,
+    stop_sequence: controlled.stopSequence,
+    usage: controlled.usage,
   };
 }
 
@@ -603,6 +1545,7 @@ function writeAnthropicStreamHead(
 ): void {
   if (res.headersSent) return;
   res.writeHead(200, {
+    ...corsHeaders(),
     ...headers,
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache, no-transform",
@@ -623,8 +1566,10 @@ function sendAnthropicStream(
 
 function sendBufferedAnthropicStreamEvents(
   res: http.ServerResponse,
-  message: any
+  message: any,
+  options: { includeThinking?: boolean } = {}
 ): void {
+  message = normalizeAnthropicMessageObject(message, options);
   sendSseEvent(res, "message_start", {
     type: "message_start",
     message: {
@@ -640,7 +1585,6 @@ function sendBufferedAnthropicStreamEvents(
         output_tokens: 0,
         cache_creation_input_tokens: message.usage.cache_creation_input_tokens,
         cache_read_input_tokens: message.usage.cache_read_input_tokens,
-        total_cost_usd: message.usage.total_cost_usd,
       },
     },
   });
@@ -649,10 +1593,12 @@ function sendBufferedAnthropicStreamEvents(
   });
   sendSseEvent(res, "message_delta", {
     type: "message_delta",
-    delta: { stop_reason: message.stop_reason || "end_turn", stop_sequence: null },
+    delta: {
+      stop_reason: message.stop_reason || "end_turn",
+      stop_sequence: message.stop_sequence ?? null,
+    },
     usage: {
       output_tokens: message.usage.output_tokens,
-      total_cost_usd: message.usage.total_cost_usd,
     },
   });
   sendSseEvent(res, "message_stop", { type: "message_stop" });
@@ -799,7 +1745,7 @@ async function handleClientToolResultTurn(
   pending: PendingClientToolTurn,
   toolResults: ReturnType<typeof extractToolResults>
 ): Promise<void> {
-  const missing = [...pending.turn.toolUseIds].filter((id) => {
+  const missing = [...pending.awaitingToolUseIds].filter((id) => {
     return !toolResults.some((result) => result.tool_use_id === id);
   });
   if (missing.length > 0) {
@@ -815,25 +1761,54 @@ async function handleClientToolResultTurn(
 
   const responseHeaders: Record<string, string> = { "request-id": requestId };
   let streamedLiveEvents = false;
-  if (body.stream === true) {
-    pending.turn.streamSink = (event, raw) => {
-      streamedLiveEvents = true;
-      if (raw?.session_id) {
-        responseHeaders["x-cc-cli-session-id"] = raw.session_id;
-      }
-      writeAnthropicStreamHead(res, responseHeaders);
-      sendSseEvent(res, event.type || "message", event);
-    };
-  }
 
+  const deliveredIds = new Set<string>();
   for (const result of toolResults) {
-    if (pending.turn.toolUseIds.has(result.tool_use_id)) {
+    if (pending.awaitingToolUseIds.has(result.tool_use_id)) {
       pending.turn.bridge.deliverToolResult(result);
+      deliveredIds.add(result.tool_use_id);
     }
   }
+  for (const id of deliveredIds) {
+    pending.awaitingToolUseIds.delete(id);
+  }
 
+  let cleanupPending = true;
   try {
-    const result = await pending.finalPromise;
+    const outcome = await Promise.race([
+      pending.finalPromise.then((result) => ({ type: "final" as const, result })),
+      pending.turn
+        .waitForReadyToolUseBatch()
+        .then((batch) => ({ type: "tool_use" as const, batch })),
+    ]);
+
+    if (outcome.type === "tool_use") {
+      pending.awaitingToolUseIds = new Set(outcome.batch.toolUseIds);
+      registerPendingClientToolTurn(pending);
+      const toolUseMessage = normalizeAnthropicMessageObject(
+        pending.turn.makeToolUseMessage(outcome.batch),
+        { includeThinking: pending.includeThinking || wantsAnthropicThinking(body) }
+      );
+
+      if (body.stream === true) {
+        writeAnthropicStreamHead(res, responseHeaders);
+        sendBufferedAnthropicStreamEvents(res, toolUseMessage, {
+          includeThinking: pending.includeThinking || wantsAnthropicThinking(body),
+        });
+        res.end();
+      } else {
+        sendJson(
+          res,
+          200,
+          toolUseMessage,
+          responseHeaders
+        );
+      }
+      cleanupPending = false;
+      return;
+    }
+
+    const result = outcome.result;
     recordTurnOutcome(result, "/v1/messages");
     responseHeaders["x-cc-cli-session-id"] = result.session_id;
     if (result.is_error) {
@@ -851,7 +1826,11 @@ async function handleClientToolResultTurn(
       return;
     }
 
-    const message = makeAnthropicMessage(pending.turn.model, result);
+    const message = makeAnthropicMessage(pending.turn.model, result, {
+      includeThinking: pending.includeThinking || wantsAnthropicThinking(body),
+      maxTokens: normalizeMaxTokens(body.max_tokens),
+      stopSequences: normalizeStopSequences(body.stop_sequences),
+    });
     auditLog.record("info", "proxy.request.completed", "Proxy request completed", {
       route: "/v1/messages",
       status: 200,
@@ -860,15 +1839,18 @@ async function handleClientToolResultTurn(
     if (body.stream === true) {
       writeAnthropicStreamHead(res, responseHeaders);
       if (!streamedLiveEvents) {
-        sendBufferedAnthropicStreamEvents(res, message);
+        sendBufferedAnthropicStreamEvents(res, message, {
+          includeThinking: pending.includeThinking || wantsAnthropicThinking(body),
+        });
       }
       res.end();
     } else {
       sendJson(res, 200, message, responseHeaders);
     }
   } finally {
-    pending.turn.streamSink = undefined;
-    cleanupPendingClientToolTurn(pending);
+    if (cleanupPending) {
+      cleanupPendingClientToolTurn(pending);
+    }
   }
 }
 
@@ -887,6 +1869,7 @@ async function handleAnthropicMessages(
     sendAnthropicError(res, 400, "invalid_request_error", "Invalid JSON body", requestId);
     return;
   }
+  writeAnthropicDiagnostic(req, requestId, "request", body);
 
   const toolResults = extractToolResults(body);
   if (toolResults.length > 0) {
@@ -901,11 +1884,25 @@ async function handleAnthropicMessages(
 
   const turnInputResult = buildTurnInputFromAnthropicMessages(body);
   if (!turnInputResult.ok) {
+    const errorBody = {
+      type: "error",
+      error: {
+        type: turnInputResult.type || "invalid_request_error",
+        message: turnInputResult.message,
+      },
+      request_id: requestId,
+    };
     auditLog.record("info", "proxy.request.completed", "Proxy request completed", {
       route: "/v1/messages",
       status: turnInputResult.status || 400,
       request_id: requestId,
       error_type: turnInputResult.type || "invalid_request_error",
+    });
+    writeAnthropicDiagnostic(req, requestId, "response", body, {
+      response: {
+        status: turnInputResult.status || 400,
+        summary: summarizeAnthropicResponseBody(errorBody),
+      },
     });
     sendAnthropicError(
       res,
@@ -918,15 +1915,34 @@ async function handleAnthropicMessages(
   }
 
   const requestedSessionId = headerValue(req, "x-cc-session-id");
-  const keepSession = headerValue(req, "x-cc-keep-session").toLowerCase() === "true";
-  let sessionId = requestedSessionId;
+  const keepSession = truthyHeader(headerValue(req, "x-cc-keep-session"));
+  const useAutoSessionAffinity = autoSessionAffinityEnabled();
+  let sessionId: string | null = requestedSessionId || null;
   let closeAfterTurn = false;
   let closeInFinally = true;
   let bridge: ClientToolBridge | null = null;
+  const includeThinking = wantsAnthropicThinking(body);
+  let autoSessionAffinityKey: string | null = null;
+  let reusingSession = false;
 
   try {
     if (sessionId) {
+      reusingSession = true;
       if (!sessions.get(sessionId)) {
+        const errorBody = {
+          type: "error",
+          error: {
+            type: "invalid_request_error",
+            message: `Unknown x-cc-session-id: ${sessionId}`,
+          },
+          request_id: requestId,
+        };
+        writeAnthropicDiagnostic(req, requestId, "response", body, {
+          response: {
+            status: 404,
+            summary: summarizeAnthropicResponseBody(errorBody),
+          },
+        });
         sendAnthropicError(
           res,
           404,
@@ -937,6 +1953,20 @@ async function handleAnthropicMessages(
         return;
       }
       if (turnInputResult.tools.length > 0) {
+        const errorBody = {
+          type: "error",
+          error: {
+            type: "invalid_request_error",
+            message: "client-supplied tools require a new Claude Code session so the proxy can attach a per-request MCP bridge",
+          },
+          request_id: requestId,
+        };
+        writeAnthropicDiagnostic(req, requestId, "response", body, {
+          response: {
+            status: 400,
+            summary: summarizeAnthropicResponseBody(errorBody),
+          },
+        });
         sendAnthropicError(
           res,
           400,
@@ -954,23 +1984,53 @@ async function handleAnthropicMessages(
         );
         clientToolBridges.set(bridge.id, bridge);
       }
-      const info = sessions.create(claudeRunnerOptionsFromConfig({
-        model: turnInputResult.model,
-        effort: turnInputResult.effort,
-        ...(bridge
-          ? {
-              mcpConfig: makeClientToolMcpConfig(bridge),
-              strictMcpConfig: true,
-              allowedTools: makeClientToolAllowedTools(turnInputResult.tools),
-            }
-          : {}),
-      }));
-      sessionId = info.id;
-      closeAfterTurn = !!bridge || !keepSession;
+      autoSessionAffinityKey = useAutoSessionAffinity
+        ? makeAutoSessionAffinityKey(req, body, turnInputResult)
+        : null;
+      const reusableSessionId = !bridge && useAutoSessionAffinity
+        ? findReusableAutoSession(autoSessionAffinityKey)
+        : null;
+      if (reusableSessionId) {
+        sessionId = reusableSessionId;
+        reusingSession = true;
+      }
+      if (!sessionId) {
+        const info = sessions.create(claudeRunnerOptionsFromConfig({
+          model: turnInputResult.model,
+          effort: turnInputResult.effort,
+          ...(bridge
+            ? {
+                mcpConfig: makeClientToolMcpConfig(bridge),
+                strictMcpConfig: true,
+                disallowedTools: SERVER_SIDE_TOOLS_DISABLED_FOR_CLIENT_BRIDGE,
+              }
+            : {}),
+        }));
+        sessionId = info.id;
+        rememberAutoSession(autoSessionAffinityKey, sessionId);
+        reusingSession = false;
+      }
+      closeAfterTurn = !!bridge || (!keepSession && !useAutoSessionAffinity);
     }
 
     const responseHeaders: Record<string, string> = { "request-id": requestId };
     if (!closeAfterTurn) responseHeaders["x-cc-session-id"] = sessionId;
+    const preparedTurn = prepareMessagesForSessionTurn(
+      sessionId,
+      turnInputResult.messages,
+      reusingSession
+    );
+    const messagesForTurn =
+      turnInputResult.shouldCollapsePlainTextHistory &&
+      !reusingSession &&
+      preparedTurn.messages.length > 1
+        ? collapsePlainTextConversation(preparedTurn.messages)
+        : preparedTurn.messages;
+    const normalizeStreamEvent = makeAnthropicStreamEventNormalizer(includeThinking);
+    const streamLiveEvents =
+      body.stream === true &&
+      !includeThinking &&
+      turnInputResult.stopSequences.length === 0;
 
     let streamedLiveEvents = false;
     const clientToolTurn = bridge
@@ -981,19 +2041,9 @@ async function handleAnthropicMessages(
           closeAfterTurn
         )
       : null;
-    if (clientToolTurn && body.stream === true) {
-      clientToolTurn.streamSink = (event, raw) => {
-        streamedLiveEvents = true;
-        if (raw?.session_id) {
-          responseHeaders["x-cc-cli-session-id"] = raw.session_id;
-        }
-        writeAnthropicStreamHead(res, responseHeaders);
-        sendSseEvent(res, event.type || "message", event);
-      };
-    }
     const finalPromise = sessions.turn(
       sessionId,
-      turnInputResult.messages,
+      messagesForTurn,
       clientToolTurn
         ? {
             onStreamEvent: (event, raw) => {
@@ -1003,15 +2053,17 @@ async function handleAnthropicMessages(
               clientToolTurn.handleStreamEvent(event, raw);
             },
           }
-        : body.stream === true
+        : streamLiveEvents
           ? {
               onStreamEvent: (event, raw) => {
-                streamedLiveEvents = true;
                 if (raw?.session_id) {
                   responseHeaders["x-cc-cli-session-id"] = raw.session_id;
                 }
+                const normalizedEvent = normalizeStreamEvent(event);
+                if (!normalizedEvent) return;
+                streamedLiveEvents = true;
                 writeAnthropicStreamHead(res, responseHeaders);
-                sendSseEvent(res, event.type || "message", event);
+                sendSseEvent(res, normalizedEvent.type || "message", normalizedEvent);
               },
             }
           : {}
@@ -1027,26 +2079,48 @@ async function handleAnthropicMessages(
       ]);
 
       if (firstOutcome.type === "tool_use") {
+        const firstBatch = clientToolTurn.takeReadyToolUseBatch();
+        if (!firstBatch) {
+          throw new Error("client tool turn became ready without a tool_use batch");
+        }
         const pending: PendingClientToolTurn = {
           turn: clientToolTurn,
           finalPromise,
           sessionId,
           closeAfterFinal: closeAfterTurn,
+          awaitingToolUseIds: new Set(firstBatch.toolUseIds),
+          includeThinking,
         };
         registerPendingClientToolTurn(pending);
+        finalPromise.then(
+          () => cleanupPendingClientToolTurn(pending),
+          () => cleanupPendingClientToolTurn(pending)
+        );
         closeInFinally = false;
+        const toolUseMessage = normalizeAnthropicMessageObject(
+          clientToolTurn.makeToolUseMessage(firstBatch),
+          { includeThinking }
+        );
 
         if (body.stream === true) {
           writeAnthropicStreamHead(res, responseHeaders);
-          if (!streamedLiveEvents) {
-            for (const event of clientToolTurn.bufferedEvents) {
-              sendSseEvent(res, event.type || "message", event);
-            }
-          }
+          sendBufferedAnthropicStreamEvents(res, toolUseMessage, { includeThinking });
           res.end();
-          clientToolTurn.streamSink = undefined;
         } else {
-          sendJson(res, 200, clientToolTurn.makeInitialMessage(), responseHeaders);
+          writeAnthropicDiagnostic(req, requestId, "response", body, {
+            response: {
+              status: 200,
+              headers: responseHeaders,
+              summary: summarizeAnthropicResponseBody(toolUseMessage),
+            },
+            session: {
+              session_id: sessionId,
+              close_after_turn: closeAfterTurn,
+              reusing_session: reusingSession,
+              sent_message_count: messagesForTurn.length,
+            },
+          });
+          sendJson(res, 200, toolUseMessage, responseHeaders);
         }
         return;
       }
@@ -1056,30 +2130,65 @@ async function handleAnthropicMessages(
     recordTurnOutcome(result, "/v1/messages");
     responseHeaders["x-cc-cli-session-id"] = result.session_id;
     if (result.is_error) {
+      const errorBody = turnErrorBody(result);
       auditLog.record("warn", "proxy.request.completed", "Proxy request completed", {
         route: "/v1/messages",
         status: turnErrorStatus(result),
         request_id: requestId,
       });
+      writeAnthropicDiagnostic(req, requestId, "response", body, {
+        response: {
+          status: turnErrorStatus(result),
+          headers: responseHeaders,
+          summary: summarizeAnthropicResponseBody(errorBody),
+        },
+        session: {
+          session_id: sessionId,
+          close_after_turn: closeAfterTurn,
+          reusing_session: reusingSession,
+          sent_message_count: messagesForTurn.length,
+        },
+      });
       if (res.headersSent) {
-        sendSseEvent(res, "error", turnErrorBody(result));
+        sendSseEvent(res, "error", errorBody);
         res.end();
       } else {
         sendTurnError(res, result, requestId);
       }
       return;
     }
+    if (!closeAfterTurn) {
+      sessionConversationUserKeys.set(sessionId, preparedTurn.userKeysAfterTurn);
+    }
 
-    const message = makeAnthropicMessage(turnInputResult.model, result);
+    const message = makeAnthropicMessage(turnInputResult.model, result, {
+      includeThinking,
+      maxTokens: turnInputResult.maxTokens,
+      stopSequences: turnInputResult.stopSequences,
+    });
     auditLog.record("info", "proxy.request.completed", "Proxy request completed", {
       route: "/v1/messages",
       status: 200,
       request_id: requestId,
     });
+    writeAnthropicDiagnostic(req, requestId, "response", body, {
+      response: {
+        status: 200,
+        headers: responseHeaders,
+        streamed_live_events: streamedLiveEvents,
+        summary: summarizeAnthropicResponseBody(message),
+      },
+      session: {
+        session_id: sessionId,
+        close_after_turn: closeAfterTurn,
+        reusing_session: reusingSession,
+        sent_message_count: messagesForTurn.length,
+      },
+    });
     if (body.stream === true) {
       writeAnthropicStreamHead(res, responseHeaders);
       if (!streamedLiveEvents) {
-        sendBufferedAnthropicStreamEvents(res, message);
+        sendBufferedAnthropicStreamEvents(res, message, { includeThinking });
       }
       res.end();
     } else {
@@ -1087,18 +2196,45 @@ async function handleAnthropicMessages(
     }
   } catch (err: any) {
     if (err instanceof CapacityError) {
+      const errorBody = {
+        type: "error",
+        error: { type: "api_error", message: err.message },
+        request_id: requestId,
+      };
+      writeAnthropicDiagnostic(req, requestId, "error", body, {
+        response: {
+          status: 503,
+          summary: summarizeAnthropicResponseBody(errorBody),
+        },
+      });
       sendAnthropicError(res, 503, "api_error", err.message, requestId);
     } else if (isClaudeProcessFailure(err)) {
       const details = recordClaudeExceptionOutcome(err, "/v1/messages");
+      const errorBody = details.body || {
+        type: "error",
+        error: {
+          type: details.type || "api_error",
+          message: details.message || "request failed",
+        },
+        request_id: requestId,
+      };
+      writeAnthropicDiagnostic(req, requestId, "error", body, {
+        response: {
+          status: details.status_code || 502,
+          summary: summarizeAnthropicResponseBody(errorBody),
+        },
+        claude_error: {
+          message: details.message,
+          stderr: err.details.stderr || "",
+          exit_code: err.details.exitCode ?? null,
+        },
+      });
       if (res.headersSent) {
         log("ERROR", "Anthropic messages request failed after stream started", {
           error: details.message,
           stderr: err.details.stderr || "",
         });
-        sendSseEvent(res, "error", details.body || {
-          type: "error",
-          error: { type: details.type || "api_error", message: details.message || "request failed" },
-        });
+        sendSseEvent(res, "error", errorBody);
         res.end();
       } else {
         log("ERROR", "Anthropic messages request failed", {
@@ -1109,20 +2245,42 @@ async function handleAnthropicMessages(
         sendExceptionAsAnthropicError(res, err, requestId);
       }
     } else if (res.headersSent) {
+      const errorBody = {
+        type: "error",
+        error: { type: "api_error", message: err.message || "request failed" },
+        request_id: requestId,
+      };
+      writeAnthropicDiagnostic(req, requestId, "error", body, {
+        response: {
+          status: 500,
+          summary: summarizeAnthropicResponseBody(errorBody),
+        },
+      });
       log("ERROR", "Anthropic messages request failed after stream started", {
         error: err.message,
       });
-      sendSseEvent(res, "error", {
-        type: "error",
-        error: { type: "api_error", message: err.message || "request failed" },
-      });
+      sendSseEvent(res, "error", errorBody);
       res.end();
     } else {
+      const errorBody = {
+        type: "error",
+        error: { type: "api_error", message: err.message || "request failed" },
+        request_id: requestId,
+      };
+      writeAnthropicDiagnostic(req, requestId, "error", body, {
+        response: {
+          status: 500,
+          summary: summarizeAnthropicResponseBody(errorBody),
+        },
+      });
       log("ERROR", "Anthropic messages request failed", { error: err.message });
       sendAnthropicError(res, 500, "api_error", err.message || "request failed", requestId);
     }
   } finally {
-    if (closeInFinally && closeAfterTurn && sessionId) sessions.close(sessionId);
+    if (closeInFinally && closeAfterTurn && sessionId) {
+      sessions.close(sessionId);
+      forgetSessionState(sessionId);
+    }
     if (closeInFinally && bridge) {
       bridge.dispose();
       clientToolBridges.delete(bridge.id);
@@ -1556,6 +2714,11 @@ const server = http.createServer(async (req, res) => {
   const pathname = url.pathname;
 
   try {
+    if (req.method === "OPTIONS") {
+      sendCorsPreflight(res);
+      return;
+    }
+
     if (await handleAdminRequest(req, res, pathname, url)) {
       return;
     }
@@ -1579,6 +2742,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Anthropic-compatible Messages API
+    if (req.method === "POST" && pathname === "/v1/messages/count_tokens") {
+      await handleAnthropicCountTokens(req, res);
+      return;
+    }
+
     if (req.method === "POST" && pathname === "/v1/messages") {
       await handleAnthropicMessages(req, res);
       return;
@@ -1612,6 +2780,7 @@ const server = http.createServer(async (req, res) => {
       }
       if (req.method === "DELETE") {
         const ok = sessions.close(id);
+        if (ok) forgetSessionState(id);
         log("INFO", "Session closed", { id, found: ok });
         sendJson(res, ok ? 200 : 404, { closed: ok });
         return;
